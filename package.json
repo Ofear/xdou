@@ -18,7 +18,11 @@
     "agents",
     "cli",
     "codex",
-    "claude"
+    "claude",
+    "multi-agent",
+    "coding-agents",
+    "developer-tools",
+    "automation"
   ],
   "author": "Ofir",
   "license": "MIT",
@@ -71,5 +75,16 @@
       "default": "./dist/cli.js"
     }
   },
-  "types": "dist/cli.d.ts"
+  "types": "dist/cli.d.ts",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Ofear/xdou.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Ofear/xdou/issues"
+  },
+  "homepage": "https://github.com/Ofear/xdou#readme",
+  "publishConfig": {
+    "access": "public"
+  }
 }
