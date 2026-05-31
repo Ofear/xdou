@@ -5,9 +5,11 @@ import { ArtifactStore } from './core/artifact-store.js';
 import { compileContextPacket } from './core/context-compiler.js';
 import { applyPatch, createProjectSnapshot, createRunWorktree, ensureCleanWorkingTree, ensureGitRepo, gitDiff, repoSummary } from './core/repo.js';
 import { checkMissionCompletion } from './core/mission-check.js';
+import { extractReviewVerdict, reviewVerdictBlocks } from './core/review-verdict.js';
 import { runValidation } from './core/validation.js';
 import { defaultAgents, selectAgents } from './agents/registry.js';
 import type { AgentAdapter, AgentRunResult, ValidationResult } from './types.js';
+import type { ReviewVerdict } from './core/review-verdict.js';
 import type { AgentDefinition } from './agents/registry.js';
 
 export interface RunOptions {
@@ -26,7 +28,7 @@ export interface RunOptions {
 }
 
 interface CouncilOutput { agent: string; role: 'brainstormer' | 'critic'; result: AgentRunResult }
-interface ReviewOutput { agent: string; result: AgentRunResult }
+interface ReviewOutput { agent: string; result: AgentRunResult; verdict: ReviewVerdict }
 
 export class XdouOrchestrator {
   readonly cwd: string;
@@ -160,7 +162,7 @@ export class XdouOrchestrator {
     if (failed && maxFixAttempts > 0) await this.store.appendEvent(run.id, { type: 'fix.exhausted', attempts: maxFixAttempts });
     await this.store.writeText(run.id, 'final-summary.md', this.formatFinalSummary(options.mission, run.id, synthesis, validation, reviewResults, failed, workspace.worktreePath));
     const finalManifest = await this.store.updateManifest(run.id, { status: failed ? 'blocked' : 'completed', phase: failed ? 'needs_attention' : 'done' });
-    await this.store.writeJson(run.id, 'result.json', { runId: run.id, status: finalManifest.status, phase: finalManifest.phase, artifactDir: finalManifest.artifactDir, worktreePath: finalManifest.worktreePath, validation, reviews: reviewResults.map((review) => ({ agent: review.agent, ok: review.result.ok })) });
+    await this.store.writeJson(run.id, 'result.json', { runId: run.id, status: finalManifest.status, phase: finalManifest.phase, artifactDir: finalManifest.artifactDir, worktreePath: finalManifest.worktreePath, validation, reviews: reviewResults.map((review) => ({ agent: review.agent, ok: review.result.ok, verdict: review.verdict })) });
     cleanupSignals();
     if (failed) console.error(pc.yellow(`xdou run ${run.id} completed with blockers; inspect ${this.store.runDir(run.id)}`));
     return run.id;
@@ -207,11 +209,14 @@ export class XdouOrchestrator {
       await this.store.writeText(runId, `agents/${reviewer.id}/review-inbox.md`, prompt);
       const input = { cwd, runDir: this.store.runDir(runId), prompt, ...(timeoutMs ? { timeoutMs } : {}) };
       const result = await reviewer.run(input);
+      const verdict = extractReviewVerdict(result.stdout || result.stderr);
       await this.store.writeJson(runId, `agents/${reviewer.id}/review-result.json`, result);
-      await this.store.appendEvent(runId, { type: 'review.finished', by: reviewer.id, ok: result.ok });
-      return { agent: reviewer.id, result };
+      await this.store.writeJson(runId, `agents/${reviewer.id}/review-verdict.json`, verdict);
+      await this.store.appendEvent(runId, { type: 'review.finished', by: reviewer.id, ok: result.ok, verdict: verdict.verdict });
+      return { agent: reviewer.id, result, verdict };
     }));
     await this.store.writeText(runId, 'review.md', outputs.map((review) => `## ${review.agent}\n\n${review.result.stdout || review.result.stderr}`).join('\n\n---\n\n'));
+    await this.store.writeJson(runId, 'review-verdicts.json', outputs.map((review) => ({ agent: review.agent, ...review.verdict })));
     return outputs;
   }
 
@@ -242,7 +247,7 @@ export class XdouOrchestrator {
   }
 
   private hasBlockers(lastMutation: AgentRunResult, validation: ValidationResult[], reviews: ReviewOutput[]): boolean {
-    return !lastMutation.ok || validation.some((v) => v.status === 'failed') || reviews.some((review) => !review.result.ok || /verdict:\s*(request_changes|blocked)|"verdict"\s*:\s*"(request_changes|blocked)"/i.test(review.result.stdout));
+    return !lastMutation.ok || validation.some((v) => v.status === 'failed') || reviews.some((review) => !review.result.ok || reviewVerdictBlocks(review.verdict));
   }
 
   private installAbortSignalHandlers(runId: string): () => void {

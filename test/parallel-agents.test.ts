@@ -21,7 +21,8 @@ class DelayedAgent implements AgentAdapter {
     starts.push({ id: this.id, role, time: Date.now() });
     await new Promise((resolve) => setTimeout(resolve, this.delayMs));
     if (this.mutate) writeFileSync(join(input.cwd, 'implemented.txt'), 'done\n');
-    return { agent: this.id, command: this.command, args: [input.prompt], exitCode: 0, stdout: `${this.id} ok`, stderr: '', durationMs: this.delayMs, ok: true };
+    const stdout = input.prompt.includes('ROLE: reviewer') ? 'REVIEW_VERDICT:\n{"verdict":"approve","confidence":1,"reason":"test reviewer approves","missingRequirements":[]}' : `${this.id} ok`;
+    return { agent: this.id, command: this.command, args: [input.prompt], exitCode: 0, stdout, stderr: '', durationMs: this.delayMs, ok: true };
   }
 }
 

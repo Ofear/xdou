@@ -30,7 +30,7 @@ class FakeAgent implements AgentAdapter {
       command: this.command,
       args: [input.prompt],
       exitCode: 0,
-      stdout: `# ${this.id} output\n\nrole prompt included ${input.prompt.includes('ROLE:') ? 'role' : 'missing-role'}`,
+      stdout: input.prompt.includes('ROLE: reviewer') ? 'REVIEW_VERDICT:\n{"verdict":"approve","confidence":1,"reason":"test reviewer approves","missingRequirements":[]}' : `# ${this.id} output\n\nrole prompt included ${input.prompt.includes('ROLE:') ? 'role' : 'missing-role'}`,
       stderr: '',
       durationMs: Date.now() - started,
       ok: true,

@@ -24,12 +24,13 @@ class WritingAgent implements AgentAdapter {
 
   run(input: AgentInput): Promise<AgentRunResult> {
     writeFileSync(join(input.cwd, this.marker), `written by ${this.id}\n`);
+    const stdout = input.prompt.includes('ROLE: reviewer') ? 'REVIEW_VERDICT:\n{"verdict":"approve","confidence":1,"reason":"test reviewer approves","missingRequirements":[]}' : `ok ${this.id}`;
     return Promise.resolve({
       agent: this.id,
       command: this.command,
       args: [input.prompt],
       exitCode: 0,
-      stdout: `ok ${this.id}`,
+      stdout,
       stderr: '',
       durationMs: 0,
       ok: true,

@@ -48,6 +48,17 @@ export function compileContextPacket(input: ContextInput): string {
   lines.push(...list('KNOWN RISKS:', input.risks));
   if (input.diff) lines.push('DIFF TO REVIEW:', input.diff, '');
   if (input.validation) lines.push('VALIDATION RESULT:', `Command: ${input.validation.command}`, `Status: ${input.validation.status}`, input.validation.output, '');
+  if (input.role === 'reviewer') {
+    lines.push(
+      'SEMANTIC REVIEW CONTRACT:',
+      'You are the semantic completion gate. Decide whether the implementation satisfies the mission, not merely whether tests pass.',
+      'End your response with exactly one machine-readable verdict block:',
+      'REVIEW_VERDICT:',
+      '{"verdict":"approve|request_changes|blocked","confidence":0.0,"reason":"one sentence","missingRequirements":["requirement not satisfied"]}',
+      'Use request_changes when the diff/tests are green but the mission is semantically incomplete or incorrect.',
+      '',
+    );
+  }
   if (input.budget === 'full' && input.transcript) lines.push('RAW TRANSCRIPT FOR DEBUGGING ONLY:', input.transcript, '');
   lines.push('OUTPUT CONTRACT:', 'Return concise structured markdown with: Summary, Files changed/reviewed, Tests run, Issues/risks, Recommended next step.');
   return lines.join('\n');

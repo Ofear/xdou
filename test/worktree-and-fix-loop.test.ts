@@ -26,7 +26,7 @@ class ScriptedAgent implements AgentAdapter {
       command: this.command,
       args: [input.prompt],
       exitCode: override.exitCode ?? 0,
-      stdout: override.stdout ?? `${this.id} ok`,
+      stdout: override.stdout ?? (input.prompt.includes('ROLE: reviewer') ? 'REVIEW_VERDICT:\n{"verdict":"approve","confidence":1,"reason":"test reviewer approves","missingRequirements":[]}' : `${this.id} ok`),
       stderr: override.stderr ?? '',
       durationMs: Date.now() - started,
       ok: override.ok ?? true,

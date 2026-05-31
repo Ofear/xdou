@@ -6,17 +6,16 @@ import { execa } from 'execa';
 import { XdouOrchestrator } from '../src/orchestrator.js';
 import type { AgentAdapter, AgentInput, AgentInvocation, AgentRole, AgentRunResult, AgentType } from '../src/types.js';
 
-class StaticAgent implements AgentAdapter {
+class SemanticAgent implements AgentAdapter {
   readonly type: AgentType = 'codex';
   readonly command: string;
-  constructor(readonly id: string, readonly roles: AgentRole[], private readonly behavior: (input: AgentInput) => void = () => undefined) {
-    this.command = `static-${id}`;
+  constructor(readonly id: string, readonly roles: AgentRole[], private readonly behavior: (input: AgentInput) => string = () => 'ok') {
+    this.command = `semantic-${id}`;
   }
   buildInvocation(input: AgentInput): AgentInvocation { return { command: this.command, args: [input.prompt], cwd: input.cwd, shell: false }; }
-  detect(): Promise<{ available: boolean; version: string }> { return Promise.resolve({ available: true, version: 'static' }); }
+  detect(): Promise<{ available: boolean; version: string }> { return Promise.resolve({ available: true, version: 'semantic' }); }
   run(input: AgentInput): Promise<AgentRunResult> {
-    this.behavior(input);
-    const stdout = input.prompt.includes('ROLE: reviewer') ? 'REVIEW_VERDICT:\n{"verdict":"approve","confidence":1,"reason":"test reviewer approves","missingRequirements":[]}' : `${this.id} ok`;
+    const stdout = this.behavior(input);
     return Promise.resolve({ agent: this.id, command: this.command, args: [input.prompt], exitCode: 0, stdout, stderr: '', durationMs: 0, ok: true });
   }
 }
@@ -32,21 +31,27 @@ async function initGitRepo(cwd: string): Promise<void> {
   await execa('git', ['commit', '-m', 'initial'], { cwd });
 }
 
-describe('mission completion validation', () => {
-  it('blocks a false green when the requested function never appears in the produced diff', async () => {
+describe('semantic reviewer completion gate', () => {
+  it('blocks a symbol-present but semantically rejected implementation', async () => {
     const cwd = temporaryDirectory();
     await initGitRepo(cwd);
     const orchestrator = new XdouOrchestrator(cwd, '.xdou', {}, {
-      claude: new StaticAgent('claude', ['brainstormer', 'architect', 'reviewer']),
-      codex: new StaticAgent('codex', ['implementer'], (input) => writeFileSync(join(input.cwd, 'notes.txt'), 'unrelated change\n')),
+      claude: new SemanticAgent('claude', ['brainstormer', 'architect', 'reviewer'], (input) => {
+        if (input.prompt.includes('ROLE: reviewer')) return 'REVIEW_VERDICT:\n{"verdict":"request_changes","confidence":0.95,"reason":"divide returns multiplication","missingRequirements":["divide must return quotient"]}';
+        return 'plan ok';
+      }),
+      codex: new SemanticAgent('codex', ['implementer'], (input) => {
+        writeFileSync(join(input.cwd, 'math.js'), 'export function add(a,b){ return a+b; }\nexport function divide(a,b){ return a*b; }\n');
+        return 'implemented divide';
+      }),
     });
 
     const runId = await orchestrator.run({ cwd, mission: 'Add a divide(a, b) function exported from math.js', team: ['claude', 'codex', 'claude'], maxFixAttempts: 0 });
     const manifest = await orchestrator.store.readManifest(runId);
-    const validation = readFileSync(join(orchestrator.store.runDir(runId), 'mission-check.json'), 'utf8');
+    const semantic = readFileSync(join(orchestrator.store.runDir(runId), 'review-verdicts.json'), 'utf8');
 
     expect(manifest.status).toBe('blocked');
-    expect(validation).toContain('divide');
-    expect(validation).toContain('failed');
+    expect(semantic).toContain('request_changes');
+    expect(semantic).toContain('divide returns multiplication');
   });
 });
