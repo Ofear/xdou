@@ -2,7 +2,7 @@ import pc from 'picocolors';
 import { join } from 'node:path';
 import { ArtifactStore } from './core/artifact-store.js';
 import { compileContextPacket } from './core/context-compiler.js';
-import { ensureCleanWorkingTree, ensureGitRepo, gitDiff, repoSummary } from './core/repo.js';
+import { createRunWorktree, ensureCleanWorkingTree, ensureGitRepo, gitDiff, repoSummary } from './core/repo.js';
 import { runValidation } from './core/validation.js';
 import { defaultAgents, selectAgents } from './agents/registry.js';
 import type { AgentAdapter, AgentRunResult, ValidationResult } from './types.js';
@@ -16,11 +16,15 @@ export interface RunOptions {
   brainstormers?: string[];
   critics?: string[];
   reviewers?: string[];
+  fixer?: string;
+  maxFixAttempts?: number;
+  isolated?: boolean;
   execute?: boolean;
   timeoutMs?: number;
 }
 
 interface CouncilOutput { agent: string; role: 'brainstormer' | 'critic'; result: AgentRunResult }
+interface ReviewOutput { agent: string; result: AgentRunResult }
 
 export class XdouOrchestrator {
   readonly cwd: string;
@@ -50,8 +54,9 @@ export class XdouOrchestrator {
     const project = await repoSummary(this.cwd);
     await this.store.writeText(run.id, 'project.md', project || 'No common project metadata found.');
     const council = await this.runCouncil(run.id, mission, project, names, []);
-    await this.store.writeText(run.id, 'brainstorm.md', this.formatCouncil(council));
-    await this.store.writeText(run.id, 'council.md', this.formatCouncil(council));
+    const councilText = this.formatCouncil(council);
+    await this.store.writeText(run.id, 'brainstorm.md', councilText);
+    await this.store.writeText(run.id, 'council.md', councilText);
     await this.store.updateManifest(run.id, { status: 'completed', phase: 'brainstormed' });
     return run.id;
   }
@@ -97,22 +102,60 @@ export class XdouOrchestrator {
     if (!planResult.ok) { await this.store.updateManifest(run.id, { status: 'blocked', phase: 'planning_failed' }); throw new Error(`Architect failed: ${planResult.stderr}`); }
     if (options.execute === false) { await this.store.updateManifest(run.id, { status: 'completed', phase: 'planned' }); return run.id; }
 
-    await this.store.updateManifest(run.id, { phase: 'implementation' });
+    const workspace = options.isolated === false ? { cwd: this.cwd } : await createRunWorktree(this.cwd, run.id);
+    await this.store.updateManifest(run.id, { phase: 'implementation', ...(workspace.worktreePath ? { worktreePath: workspace.worktreePath, baseRef: workspace.baseRef } : {}) });
     const implPrompt = compileContextPacket({ runId: run.id, agent: implementer.id, role: 'implementer', mission: options.mission, projectContext: project, plan: synthesis, budget: 'balanced' });
-    const implInput = { cwd: this.cwd, runDir: this.store.runDir(run.id), prompt: implPrompt, ...(options.timeoutMs ? { timeoutMs: options.timeoutMs } : {}) };
+    const implInput = { cwd: workspace.cwd, runDir: this.store.runDir(run.id), prompt: implPrompt, ...(options.timeoutMs ? { timeoutMs: options.timeoutMs } : {}) };
     const implResult = await implementer.run(implInput);
     await this.store.writeJson(run.id, `agents/${implementer.id}/implementation-result.json`, implResult);
     await this.store.appendEvent(run.id, { type: 'implementation.finished', by: implementer.id, ok: implResult.ok });
 
-    const diff = await gitDiff(this.cwd);
+    let diff = await gitDiff(workspace.cwd);
     await this.store.writeText(run.id, 'diff.patch', diff || 'No diff produced.');
-    const validation = await runValidation(this.cwd);
+    let validation = await runValidation(workspace.cwd);
     await this.store.writeJson(run.id, 'validation.json', validation);
+    await this.store.appendEvent(run.id, { type: 'validation.finished', ok: !validation.some((v) => v.status === 'failed') });
 
     await this.store.updateManifest(run.id, { phase: 'review' });
-    const reviewResults = await this.runReviews(run.id, options.mission, synthesis, diff, validation, reviewerNames, options.timeoutMs);
-    const failed = !implResult.ok || validation.some((v) => v.status === 'failed') || reviewResults.some((review) => !review.result.ok);
-    await this.store.writeText(run.id, 'final-summary.md', this.formatFinalSummary(options.mission, run.id, synthesis, validation, reviewResults, failed));
+    let reviewResults = await this.runReviews(run.id, workspace.cwd, options.mission, synthesis, diff, validation, reviewerNames, options.timeoutMs);
+    let failed = this.hasBlockers(implResult, validation, reviewResults);
+
+    const maxFixAttempts = options.maxFixAttempts ?? 1;
+    const fixerName = options.fixer ?? implementer.id;
+    for (let attempt = 1; failed && attempt <= maxFixAttempts; attempt += 1) {
+      const [fixer] = selectAgents([fixerName], this.agents);
+      if (!fixer) break;
+      await this.store.updateManifest(run.id, { phase: `fix_${attempt}`, fixAttempts: attempt });
+      await this.store.appendEvent(run.id, { type: 'fix.started', by: fixer.id, attempt });
+      const lastValidation = validation.at(-1);
+      const fixPrompt = compileContextPacket({
+        runId: run.id,
+        agent: fixer.id,
+        role: 'fixer',
+        mission: options.mission,
+        projectContext: project,
+        plan: synthesis,
+        diff,
+        budget: 'balanced',
+        ...(lastValidation ? { validation: lastValidation } : {}),
+      });
+      await this.store.writeText(run.id, `fixes/attempt-${attempt}/inbox.md`, fixPrompt);
+      const fixInput = { cwd: workspace.cwd, runDir: this.store.runDir(run.id), prompt: fixPrompt, ...(options.timeoutMs ? { timeoutMs: options.timeoutMs } : {}) };
+      const fixResult = await fixer.run(fixInput);
+      await this.store.writeJson(run.id, `fixes/attempt-${attempt}/result.json`, fixResult);
+      await this.store.appendEvent(run.id, { type: 'fix.finished', by: fixer.id, attempt, ok: fixResult.ok });
+      diff = await gitDiff(workspace.cwd);
+      await this.store.writeText(run.id, `fixes/attempt-${attempt}/diff.patch`, diff || 'No diff produced.');
+      await this.store.writeText(run.id, 'diff.patch', diff || 'No diff produced.');
+      validation = await runValidation(workspace.cwd);
+      await this.store.writeJson(run.id, `fixes/attempt-${attempt}/validation.json`, validation);
+      await this.store.writeJson(run.id, 'validation.json', validation);
+      await this.store.appendEvent(run.id, { type: 'validation.finished', attempt, ok: !validation.some((v) => v.status === 'failed') });
+      reviewResults = await this.runReviews(run.id, workspace.cwd, options.mission, synthesis, diff, validation, reviewerNames, options.timeoutMs);
+      failed = this.hasBlockers(fixResult, validation, reviewResults);
+    }
+    if (failed && maxFixAttempts > 0) await this.store.appendEvent(run.id, { type: 'fix.exhausted', attempts: maxFixAttempts });
+    await this.store.writeText(run.id, 'final-summary.md', this.formatFinalSummary(options.mission, run.id, synthesis, validation, reviewResults, failed, workspace.worktreePath));
     await this.store.updateManifest(run.id, { status: failed ? 'blocked' : 'completed', phase: failed ? 'needs_attention' : 'done' });
     if (failed) console.error(pc.yellow(`xdou run ${run.id} completed with blockers; inspect ${this.store.runDir(run.id)}`));
     return run.id;
@@ -138,14 +181,14 @@ export class XdouOrchestrator {
     return outputs;
   }
 
-  private async runReviews(runId: string, mission: string, plan: string, diff: string, validation: ValidationResult[], reviewers: string[], timeoutMs?: number): Promise<Array<{ agent: string; result: AgentRunResult }>> {
-    const outputs: Array<{ agent: string; result: AgentRunResult }> = [];
+  private async runReviews(runId: string, cwd: string, mission: string, plan: string, diff: string, validation: ValidationResult[], reviewers: string[], timeoutMs?: number): Promise<ReviewOutput[]> {
+    const outputs: ReviewOutput[] = [];
     const lastValidation = validation.at(-1);
     for (const reviewer of selectAgents(reviewers, this.agents)) {
       const reviewContext = { runId, agent: reviewer.id, role: 'reviewer', mission, plan, diff, budget: 'minimal' as const, ...(lastValidation ? { validation: lastValidation } : {}) };
       const prompt = compileContextPacket(reviewContext);
       await this.store.writeText(runId, `agents/${reviewer.id}/review-inbox.md`, prompt);
-      const input = { cwd: this.cwd, runDir: this.store.runDir(runId), prompt, ...(timeoutMs ? { timeoutMs } : {}) };
+      const input = { cwd, runDir: this.store.runDir(runId), prompt, ...(timeoutMs ? { timeoutMs } : {}) };
       const result = await reviewer.run(input);
       await this.store.writeJson(runId, `agents/${reviewer.id}/review-result.json`, result);
       await this.store.appendEvent(runId, { type: 'review.finished', by: reviewer.id, ok: result.ok });
@@ -164,13 +207,18 @@ export class XdouOrchestrator {
     return [`# Synthesis`, '', `Architect: ${architect}`, `Council: ${participants}`, '', '## Selected implementation direction', '', plan, '', '## Collaboration rule', '', 'Implementation follows this synthesized plan, then independent reviewers inspect the resulting diff and validation output.'].join('\n');
   }
 
-  private formatFinalSummary(mission: string, runId: string, synthesis: string, validation: ValidationResult[], reviews: Array<{ agent: string; result: AgentRunResult }>, failed: boolean): string {
+  private hasBlockers(lastMutation: AgentRunResult, validation: ValidationResult[], reviews: ReviewOutput[]): boolean {
+    return !lastMutation.ok || validation.some((v) => v.status === 'failed') || reviews.some((review) => !review.result.ok || /verdict:\s*(request_changes|blocked)|"verdict"\s*:\s*"(request_changes|blocked)"/i.test(review.result.stdout));
+  }
+
+  private formatFinalSummary(mission: string, runId: string, synthesis: string, validation: ValidationResult[], reviews: ReviewOutput[], failed: boolean, worktreePath?: string): string {
     return [
       '# XDOU Run Summary',
       '',
       `Run: ${runId}`,
       `Mission: ${mission}`,
       `Status: ${failed ? 'blocked' : 'completed'}`,
+      ...(worktreePath ? [`Worktree: ${worktreePath}`] : []),
       `Reviewers: ${reviews.map((review) => review.agent).join(', ') || 'none'}`,
       '',
       '## Validation',

@@ -10,4 +10,4 @@ export interface AgentInvocation { command: string; args: string[]; cwd: string;
 export interface AgentRunResult { agent: string; command: string; args: string[]; exitCode: number; stdout: string; stderr: string; durationMs: number; ok: boolean }
 export interface AgentAdapter { id: string; type: AgentType; roles: AgentRole[]; buildInvocation(input: AgentInput): AgentInvocation; detect(): Promise<{available: boolean; path?: string; version?: string; error?: string}>; run(input: AgentInput): Promise<AgentRunResult> }
 
-export interface RunManifest { id: string; mission: string; createdAt: string; updatedAt: string; status: RunStatus; phase: string; artifactDir: string; events: number }
+export interface RunManifest { id: string; mission: string; createdAt: string; updatedAt: string; status: RunStatus; phase: string; artifactDir: string; events: number; worktreePath?: string; baseRef?: string; fixAttempts?: number }

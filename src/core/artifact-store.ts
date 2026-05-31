@@ -64,9 +64,19 @@ export class ArtifactStore {
   }
 
   async latestRunId(): Promise<string | undefined> {
+    const runs = await this.listRuns();
+    return runs.at(-1)?.id;
+  }
+
+  async listRuns(): Promise<RunManifest[]> {
     const runsDir = join(this.root, 'runs');
-    if (!(await fs.pathExists(runsDir))) return undefined;
+    if (!(await fs.pathExists(runsDir))) return [];
     const entries = await fs.readdir(runsDir);
-    return entries.sort().at(-1);
+    const manifests: RunManifest[] = [];
+    for (const entry of entries.sort()) {
+      const manifestPath = join(runsDir, entry, 'manifest.json');
+      if (await fs.pathExists(manifestPath)) manifests.push(await fs.readJson(manifestPath) as RunManifest);
+    }
+    return manifests;
   }
 }

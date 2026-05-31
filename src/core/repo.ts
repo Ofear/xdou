@@ -2,6 +2,8 @@ import { execa } from 'execa';
 import fs from 'fs-extra';
 import { join } from 'node:path';
 
+export interface RunWorkspace { cwd: string; worktreePath?: string; baseRef?: string }
+
 export async function isGitRepo(cwd: string): Promise<boolean> {
   const result = await execa('git', ['rev-parse', '--is-inside-work-tree'], { cwd, reject: false });
   return result.exitCode === 0 && result.stdout.trim() === 'true';
@@ -14,7 +16,37 @@ export async function isWorkingTreeClean(cwd: string): Promise<boolean> {
 export async function ensureCleanWorkingTree(cwd: string): Promise<void> {
   if (!(await isWorkingTreeClean(cwd))) throw new Error('Refusing to run coding agents on a dirty working tree. Commit/stash changes first, or run planning/brainstorming only.');
 }
-export async function gitDiff(cwd: string): Promise<string> { const r = await execa('git', ['diff', '--', '.'], { cwd, reject: false }); return r.stdout; }
+export async function gitDiff(cwd: string): Promise<string> {
+  const tracked = await execa('git', ['diff', 'HEAD', '--', '.'], { cwd, reject: false });
+  const untracked = await execa('git', ['ls-files', '--others', '--exclude-standard'], { cwd, reject: false });
+  const patches: string[] = [tracked.stdout].filter(Boolean);
+  for (const file of untracked.stdout.split(/\r?\n/).filter(Boolean)) {
+    const path = join(cwd, file);
+    const content = await fs.readFile(path, 'utf8').catch(() => undefined);
+    if (content === undefined) continue;
+    const lines = content.split(/\r?\n/);
+    if (lines.at(-1) === '') lines.pop();
+    patches.push([
+      `diff --git a/${file} b/${file}`,
+      'new file mode 100644',
+      'index 0000000..0000000',
+      '--- /dev/null',
+      `+++ b/${file}`,
+      `@@ -0,0 +1,${lines.length} @@`,
+      ...lines.map((line) => `+${line}`),
+    ].join('\n'));
+  }
+  return patches.join('\n\n');
+}
+export async function currentHead(cwd: string): Promise<string> { const r = await execa('git', ['rev-parse', 'HEAD'], { cwd }); return r.stdout.trim(); }
+export async function createRunWorktree(repoRoot: string, runId: string, artifactDir = '.xdou'): Promise<RunWorkspace> {
+  const baseRef = await currentHead(repoRoot);
+  const worktreePath = join(repoRoot, artifactDir, 'worktrees', runId);
+  await fs.remove(worktreePath);
+  await fs.ensureDir(join(worktreePath, '..'));
+  await execa('git', ['worktree', 'add', '--detach', worktreePath, baseRef], { cwd: repoRoot });
+  return { cwd: worktreePath, worktreePath, baseRef };
+}
 export async function repoSummary(cwd: string): Promise<string> {
   const files = ['package.json','pyproject.toml','Cargo.toml','go.mod','README.md'];
   const parts: string[] = [];

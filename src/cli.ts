@@ -12,7 +12,12 @@ import { loadConfig } from './config/load.js';
 class Xdou extends Command {
   static override description = 'xdou: multi-agent coding from your terminal';
   static override strict = false;
-  static override flags = { cwd: Flags.string({ default: process.cwd(), description: 'Working directory' }), json: Flags.boolean({ default: false }) };
+  static override flags = {
+    cwd: Flags.string({ default: process.cwd(), description: 'Working directory' }),
+    json: Flags.boolean({ default: false }),
+    agents: Flags.string({ description: 'Comma-separated agent ids for brainstorm/plan/run' }),
+    'max-fix-attempts': Flags.integer({ default: 1, description: 'Maximum fixer iterations for run' }),
+  };
 
   async run(): Promise<void> {
     const { argv, flags } = await this.parse(Xdou);
@@ -26,18 +31,20 @@ class Xdou extends Command {
     switch (cmd) {
       case 'init': await this.initProject(cwd); break;
       case 'agents': await this.agents(orchestrator, rest, flags.json); break;
-      case 'brainstorm': await this.brainstorm(orchestrator, rest, team); break;
-      case 'plan': await this.plan(orchestrator, rest, team); break;
-      case 'run': await this.runMission(orchestrator, rest, team); break;
+      case 'brainstorm': await this.brainstorm(orchestrator, rest, team, flags.agents); break;
+      case 'plan': await this.plan(orchestrator, rest, team, flags.agents); break;
+      case 'run': await this.runMission(orchestrator, rest, team, flags.agents, flags['max-fix-attempts']); break;
       case 'status': await this.status(orchestrator, rest, flags.json); break;
+      case 'runs': await this.runs(orchestrator, rest, flags.json); break;
       case 'context': await this.context(orchestrator, rest); break;
+      case 'config': await this.configCommand(cwd, rest); break;
       case undefined:
       case 'help':
       case '--help':
       case '-h':
-        this.log('xdou: multi-agent coding from your terminal\n\nCommands:\n  init\n  agents [list|detect]\n  brainstorm <mission> [--agents a,b]\n  plan <mission>\n  run <mission> [--agents architect,implementer,reviewer]\n  status [run-id]\n  context [run-id]');
+        this.log('xdou: multi-agent coding from your terminal\n\nCommands:\n  init\n  agents [list|detect]\n  brainstorm <mission> [--agents a,b]\n  plan <mission>\n  run <mission> [--agents architect,implementer,reviewer] [--max-fix-attempts n]\n  status [run-id]\n  runs list\n  context [run-id]\n  config validate');
         break;
-      default: throw new Error(`Unknown command: ${cmd}. Try: xdou init | agents detect | brainstorm | plan | run | status | context`);
+      default: throw new Error(`Unknown command: ${cmd}. Try: xdou init | agents detect | brainstorm | plan | run | status | runs list | context | config validate`);
     }
   }
 
@@ -46,7 +53,17 @@ class Xdou extends Command {
     if (await fs.pathExists(configPath)) throw new Error(`Config already exists: ${configPath}`);
     await fs.writeFile(configPath, YAML.stringify(defaultConfig()), 'utf8');
     await fs.ensureDir(join(cwd, '.xdou', 'runs'));
+    await this.ensureGitignore(cwd);
     this.log(`${pc.green('created')} ${configPath}`);
+  }
+
+  private async ensureGitignore(cwd: string): Promise<void> {
+    const path = join(cwd, '.gitignore');
+    const current = await fs.readFile(path, 'utf8').catch(() => '');
+    const required = ['.xdou/runs/', '.xdou/worktrees/'];
+    const existing = current.split(/\r?\n/);
+    const missing = required.filter((line) => !existing.includes(line));
+    if (missing.length) await fs.appendFile(path, `${current && !current.endsWith('\n') ? '\n' : ''}${missing.join('\n')}\n`, 'utf8');
   }
 
   private async agents(orchestrator: XdouOrchestrator, args: string[], json: boolean): Promise<void> {
@@ -60,24 +77,39 @@ class Xdou extends Command {
   }
 
   private mission(args: string[]): string { const text = args.join(' ').trim(); if (!text) throw new Error('Mission is required. Example: xdou run "add oauth"'); return text; }
-  private parseAgents(args: string[], fallback: string[]): string[] {
+  private parseAgents(args: string[], fallback: string[], flagValue?: string): string[] {
+    if (flagValue) return flagValue.split(',').map((s) => s.trim()).filter(Boolean);
     const idx = args.indexOf('--agents');
     const value = idx >= 0 ? args[idx + 1] : undefined;
+    if (idx >= 0 && !value) throw new Error('--agents requires a comma-separated value');
     return value ? value.split(',').map((s) => s.trim()).filter(Boolean) : fallback;
   }
   private cleanMissionArgs(args: string[]): string[] { const idx = args.indexOf('--agents'); return idx >= 0 ? args.slice(0, idx) : args; }
+  private numberFlag(args: string[], name: string, fallback: number): number {
+    const idx = args.indexOf(name);
+    if (idx < 0) return fallback;
+    const value = Number(args[idx + 1]);
+    if (!Number.isInteger(value) || value < 0) throw new Error(`${name} requires a non-negative integer`);
+    return value;
+  }
+  private cleanRunArgs(args: string[]): string[] {
+    let cleaned = this.cleanMissionArgs(args);
+    const idx = cleaned.indexOf('--max-fix-attempts');
+    if (idx >= 0) cleaned = [...cleaned.slice(0, idx), ...cleaned.slice(idx + 2)];
+    return cleaned;
+  }
 
-  private async brainstorm(orchestrator: XdouOrchestrator, args: string[], team: TeamConfig): Promise<void> {
-    const agents = this.parseAgents(args, team.brainstormers);
+  private async brainstorm(orchestrator: XdouOrchestrator, args: string[], team: TeamConfig, agentsFlag?: string): Promise<void> {
+    const agents = this.parseAgents(args, team.brainstormers, agentsFlag);
     const runId = await orchestrator.brainstorm(this.mission(this.cleanMissionArgs(args)), agents);
     this.log(`${pc.green('brainstorm complete')} run=${runId} artifacts=${orchestrator.store.runDir(runId)}`);
   }
 
-  private async plan(orchestrator: XdouOrchestrator, args: string[], team: TeamConfig): Promise<void> {
-    const agents = this.parseAgents(args, [team.architect, team.implementer, team.reviewer[0] ?? team.architect]);
+  private async plan(orchestrator: XdouOrchestrator, args: string[], team: TeamConfig, agentsFlag?: string): Promise<void> {
+    const agents = this.parseAgents(args, [team.architect, team.implementer, team.reviewer[0] ?? team.architect], agentsFlag);
     const runId = await orchestrator.run({
       cwd: orchestrator.cwd,
-      mission: this.mission(this.cleanMissionArgs(args)),
+      mission: this.mission(this.cleanRunArgs(args)),
       execute: false,
       team: agents,
       brainstormers: team.brainstormers,
@@ -87,15 +119,17 @@ class Xdou extends Command {
     this.log(`${pc.green('plan complete')} run=${runId} artifacts=${orchestrator.store.runDir(runId)}`);
   }
 
-  private async runMission(orchestrator: XdouOrchestrator, args: string[], team: TeamConfig): Promise<void> {
-    const agents = this.parseAgents(args, [team.architect, team.implementer, team.reviewer[0] ?? team.architect]);
+  private async runMission(orchestrator: XdouOrchestrator, args: string[], team: TeamConfig, agentsFlag?: string, maxFixAttempts = 1): Promise<void> {
+    const agents = this.parseAgents(args, [team.architect, team.implementer, team.reviewer[0] ?? team.architect], agentsFlag);
     const runId = await orchestrator.run({
       cwd: orchestrator.cwd,
-      mission: this.mission(this.cleanMissionArgs(args)),
+      mission: this.mission(this.cleanRunArgs(args)),
       team: agents,
       brainstormers: team.brainstormers,
       critics: [team.critic],
       reviewers: team.reviewer,
+      fixer: team.fixer,
+      maxFixAttempts,
     });
     this.log(`${pc.green('run complete')} run=${runId} artifacts=${orchestrator.store.runDir(runId)}`);
   }
@@ -107,11 +141,27 @@ class Xdou extends Command {
     this.log(json ? JSON.stringify(manifest, null, 2) : `${manifest.id} ${manifest.status}/${manifest.phase}\n${manifest.artifactDir}`);
   }
 
+  private async runs(orchestrator: XdouOrchestrator, args: string[], json: boolean): Promise<void> {
+    if ((args[0] ?? 'list') !== 'list') throw new Error('Usage: xdou runs list');
+    const runs = await orchestrator.store.listRuns();
+    if (json) { this.log(JSON.stringify(runs, null, 2)); return; }
+    if (!runs.length) { this.log('No runs found.'); return; }
+    const table = new Table({ head: ['run', 'status', 'phase', 'mission'] });
+    for (const run of runs) table.push([run.id, run.status, run.phase, run.mission]);
+    this.log(table.toString());
+  }
+
   private async context(orchestrator: XdouOrchestrator, args: string[]): Promise<void> {
     const runId = args[0] ?? await orchestrator.store.latestRunId();
     if (!runId) throw new Error('No run id supplied and no previous run found.');
     const inboxPath = join(orchestrator.store.runDir(runId), 'agents');
     this.log(inboxPath);
+  }
+
+  private async configCommand(cwd: string, args: string[]): Promise<void> {
+    if ((args[0] ?? 'validate') !== 'validate') throw new Error('Usage: xdou config validate');
+    const loaded = await loadConfig(cwd);
+    this.log(`${pc.green('valid')} ${loaded.filepath ?? 'defaults'}`);
   }
 }
 
