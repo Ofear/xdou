@@ -35,6 +35,7 @@ export abstract class CliAgentAdapter implements AgentAdapter {
         timeout: input.timeoutMs ?? 30 * 60_000,
         reject: false,
         all: false,
+        ...(invocation.stdin ? { input: invocation.stdin } : { stdin: 'ignore' as const }),
         ...(invocation.env ? { env: invocation.env } : {}),
       };
       const result = await execa(invocation.command, invocation.args, options);

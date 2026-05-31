@@ -33,7 +33,8 @@ class Xdou extends Command {
       case 'agents': await this.agents(orchestrator, rest, flags.json); break;
       case 'brainstorm': await this.brainstorm(orchestrator, rest, team, flags.agents); break;
       case 'plan': await this.plan(orchestrator, rest, team, flags.agents); break;
-      case 'run': await this.runMission(orchestrator, rest, team, flags.agents, flags['max-fix-attempts']); break;
+      case 'run': await this.runMission(orchestrator, rest, team, flags.agents, flags['max-fix-attempts'], flags.json); break;
+      case 'apply': await this.apply(orchestrator, rest, flags.json); break;
       case 'status': await this.status(orchestrator, rest, flags.json); break;
       case 'runs': await this.runs(orchestrator, rest, flags.json); break;
       case 'context': await this.context(orchestrator, rest); break;
@@ -42,7 +43,7 @@ class Xdou extends Command {
       case 'help':
       case '--help':
       case '-h':
-        this.log('xdou: multi-agent coding from your terminal\n\nCommands:\n  init\n  agents [list|detect]\n  brainstorm <mission> [--agents a,b]\n  plan <mission>\n  run <mission> [--agents architect,implementer,reviewer] [--max-fix-attempts n]\n  status [run-id]\n  runs list\n  context [run-id]\n  config validate');
+        this.log('xdou: multi-agent coding from your terminal\n\nCommands:\n  init\n  agents [list|detect]\n  brainstorm <mission> [--agents a,b]\n  plan <mission>\n  run <mission> [--agents architect,implementer,reviewer] [--max-fix-attempts n] [--json]\n  apply <run-id> [--json]\n  status [run-id]\n  runs list\n  context [run-id]\n  config validate');
         break;
       default: throw new Error(`Unknown command: ${cmd}. Try: xdou init | agents detect | brainstorm | plan | run | status | runs list | context | config validate`);
     }
@@ -119,7 +120,7 @@ class Xdou extends Command {
     this.log(`${pc.green('plan complete')} run=${runId} artifacts=${orchestrator.store.runDir(runId)}`);
   }
 
-  private async runMission(orchestrator: XdouOrchestrator, args: string[], team: TeamConfig, agentsFlag?: string, maxFixAttempts = 1): Promise<void> {
+  private async runMission(orchestrator: XdouOrchestrator, args: string[], team: TeamConfig, agentsFlag?: string, maxFixAttempts = 1, json = false): Promise<void> {
     const agents = this.parseAgents(args, [team.architect, team.implementer, team.reviewer[0] ?? team.architect], agentsFlag);
     const runId = await orchestrator.run({
       cwd: orchestrator.cwd,
@@ -131,10 +132,20 @@ class Xdou extends Command {
       fixer: team.fixer,
       maxFixAttempts,
     });
-    this.log(`${pc.green('run complete')} run=${runId} artifacts=${orchestrator.store.runDir(runId)}`);
+    const manifest = await orchestrator.store.readManifest(runId);
+    const payload = { runId, status: manifest.status, phase: manifest.phase, artifactDir: manifest.artifactDir, worktreePath: manifest.worktreePath };
+    this.log(json ? JSON.stringify(payload, null, 2) : `${pc.green('run complete')} run=${runId} artifacts=${orchestrator.store.runDir(runId)}`);
+  }
+
+  private async apply(orchestrator: XdouOrchestrator, args: string[], json: boolean): Promise<void> {
+    const runId = args[0];
+    if (!runId) throw new Error('Usage: xdou apply <run-id>');
+    const result = await orchestrator.applyRun(runId);
+    this.log(json ? JSON.stringify(result, null, 2) : `${pc.green('applied')} run=${runId} files=${result.filesChanged}`);
   }
 
   private async status(orchestrator: XdouOrchestrator, args: string[], json: boolean): Promise<void> {
+    await orchestrator.store.recoverStaleRuns();
     const runId = args[0] ?? await orchestrator.store.latestRunId();
     if (!runId) { this.log('No runs found.'); return; }
     const manifest = await orchestrator.store.readManifest(runId);
@@ -143,6 +154,7 @@ class Xdou extends Command {
 
   private async runs(orchestrator: XdouOrchestrator, args: string[], json: boolean): Promise<void> {
     if ((args[0] ?? 'list') !== 'list') throw new Error('Usage: xdou runs list');
+    await orchestrator.store.recoverStaleRuns();
     const runs = await orchestrator.store.listRuns();
     if (json) { this.log(JSON.stringify(runs, null, 2)); return; }
     if (!runs.length) { this.log('No runs found.'); return; }

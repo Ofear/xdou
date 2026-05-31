@@ -79,4 +79,27 @@ export class ArtifactStore {
     }
     return manifests;
   }
+
+  async abortRun(runId: string, reason: string): Promise<RunManifest> {
+    await this.appendEvent(runId, { type: 'run.aborted', by: 'xdou', reason });
+    return this.updateManifest(runId, { status: 'aborted', phase: 'aborted', abortedReason: reason });
+  }
+
+  async recoverStaleRuns(staleAfterMs = 5 * 60_000): Promise<RunManifest[]> {
+    const now = Date.now();
+    const recovered: RunManifest[] = [];
+    for (const run of await this.listRuns()) {
+      if (run.status !== 'running') continue;
+      const updatedAt = Date.parse(run.updatedAt);
+      const isStale = Number.isFinite(updatedAt) && now - updatedAt >= staleAfterMs;
+      const pidAlive = run.processPid ? this.isPidAlive(run.processPid) : false;
+      if (!pidAlive && isStale) recovered.push(await this.abortRun(run.id, run.processPid ? `process ${run.processPid} is not running` : 'running manifest is stale and has no live process pid'));
+    }
+    return recovered;
+  }
+
+  private isPidAlive(pid: number): boolean {
+    try { process.kill(pid, 0); return true; }
+    catch { return false; }
+  }
 }

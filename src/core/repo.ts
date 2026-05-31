@@ -1,6 +1,6 @@
 import { execa } from 'execa';
 import fs from 'fs-extra';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
 
 export interface RunWorkspace { cwd: string; worktreePath?: string; baseRef?: string }
 
@@ -47,6 +47,31 @@ export async function createRunWorktree(repoRoot: string, runId: string, artifac
   await execa('git', ['worktree', 'add', '--detach', worktreePath, baseRef], { cwd: repoRoot });
   return { cwd: worktreePath, worktreePath, baseRef };
 }
+export async function createProjectSnapshot(repoRoot: string, snapshotPath: string): Promise<string> {
+  await fs.remove(snapshotPath);
+  await fs.ensureDir(snapshotPath);
+  const tracked = await execa('git', ['ls-files', '-z'], { cwd: repoRoot });
+  const files = tracked.stdout.split('\0').filter(Boolean);
+  for (const file of files) {
+    const source = join(repoRoot, file);
+    const target = join(snapshotPath, file);
+    await fs.ensureDir(dirname(target));
+    await fs.copyFile(source, target).catch(() => undefined);
+  }
+  return snapshotPath;
+}
+export interface ApplyPatchResult { filesChanged: number; files: string[] }
+
+export async function applyPatch(cwd: string, patch: string): Promise<ApplyPatchResult> {
+  if (!patch.trim() || patch.trim() === 'No diff produced.') throw new Error('Run has no diff to apply.');
+  await ensureCleanWorkingTree(cwd);
+  const files = [...patch.matchAll(/^diff --git a\/(.*?) b\/(.*?)$/gm)].map((match) => match[2]).filter((file): file is string => Boolean(file));
+  const normalizedPatch = patch.endsWith('\n') ? patch : `${patch}\n`;
+  await execa('git', ['apply', '--check', '-'], { cwd, input: normalizedPatch });
+  await execa('git', ['apply', '-'], { cwd, input: normalizedPatch });
+  return { filesChanged: new Set(files).size, files: [...new Set(files)] };
+}
+
 export async function repoSummary(cwd: string): Promise<string> {
   const files = ['package.json','pyproject.toml','Cargo.toml','go.mod','README.md'];
   const parts: string[] = [];

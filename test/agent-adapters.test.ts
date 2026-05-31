@@ -15,13 +15,15 @@ describe('agent adapters command construction', () => {
 
   it('constructs Codex exec command safely', () => {
     const cmd = new CodexAdapter({ command: 'codex', fullAuto: true }).buildInvocation(input);
-    expect(cmd.args).toEqual(['exec', '--full-auto', 'hello']);
+    expect(cmd.args).toEqual(['exec', '--cd', process.cwd(), '--dangerously-bypass-approvals-and-sandbox', '-']);
+    expect(cmd.stdin).toBe('hello');
     expect(cmd.shell).toBe(false);
   });
 
   it('keeps Codex full-auto opt-in instead of default', () => {
     const cmd = new CodexAdapter({ command: 'codex' }).buildInvocation(input);
-    expect(cmd.args).toEqual(['exec', 'hello']);
+    expect(cmd.args).toEqual(['exec', '--cd', process.cwd(), '-']);
+    expect(cmd.stdin).toBe('hello');
   });
 
   it('constructs OpenCode one-shot command safely', () => {

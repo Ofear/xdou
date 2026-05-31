@@ -13,9 +13,8 @@ export class CodexAdapter extends CliAgentAdapter {
   }
 
   buildInvocation(input: AgentInput): AgentInvocation {
-    const args = ['exec'];
-    if (this.fullAuto) args.push('--full-auto');
-    args.push(input.prompt);
-    return { command: this.command, args, cwd: input.cwd, shell: false };
+    const args = ['exec', '--cd', input.cwd, '-'];
+    if (this.fullAuto) args.splice(3, 0, '--dangerously-bypass-approvals-and-sandbox');
+    return { command: this.command, args, cwd: input.cwd, shell: false, stdin: input.prompt };
   }
 }
