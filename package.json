@@ -1,0 +1,75 @@
+{
+  "name": "xdou",
+  "version": "1.0.0",
+  "description": "A terminal-native multi-agent development system where selected coding and architecture agents co-develop through council, synthesis, implementation, review, and validation loops.",
+  "main": "dist/cli.js",
+  "scripts": {
+    "test": "vitest run",
+    "build": "tsup src/cli.ts --format esm --dts --sourcemap --clean",
+    "dev": "tsx src/cli.ts",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint src test --ext .ts",
+    "prepublishOnly": "npm run lint && npm run typecheck && npm test && npm run build && npx publint",
+    "postbuild": "node -e \"try{require('fs').chmodSync('dist/cli.js',0o755)}catch{}\"",
+    "prepack": "npm run build"
+  },
+  "keywords": [
+    "ai",
+    "agents",
+    "cli",
+    "codex",
+    "claude"
+  ],
+  "author": "Ofir",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "xdou": "dist/cli.js"
+  },
+  "engines": {
+    "node": ">=20.19.0"
+  },
+  "dependencies": {
+    "@oclif/core": "^4.11.4",
+    "@openrouter/ai-sdk-provider": "^2.9.0",
+    "ai": "^6.0.193",
+    "cli-table3": "^0.6.5",
+    "cosmiconfig": "^9.0.1",
+    "dotenv": "^17.4.2",
+    "execa": "^9.6.1",
+    "fs-extra": "^11.3.5",
+    "picocolors": "^1.1.1",
+    "proper-lockfile": "^4.1.2",
+    "strip-ansi": "^7.2.0",
+    "which": "^5.0.0",
+    "write-file-atomic": "^7.0.1",
+    "yaml": "^2.9.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/fs-extra": "^11.0.4",
+    "@types/node": "^25.9.1",
+    "@types/which": "^3.0.4",
+    "@types/write-file-atomic": "^4.0.3",
+    "@typescript-eslint/eslint-plugin": "^8.60.0",
+    "@typescript-eslint/parser": "^8.60.0",
+    "eslint": "^10.4.1",
+    "publint": "^0.3.21",
+    "tempy": "^3.2.0",
+    "tsup": "^8.5.1",
+    "tsx": "^4.22.3",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.7"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/cli.d.ts",
+      "default": "./dist/cli.js"
+    }
+  },
+  "types": "dist/cli.d.ts"
+}
