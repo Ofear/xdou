@@ -5,6 +5,7 @@ import { ArtifactStore } from './core/artifact-store.js';
 import { compileContextPacket } from './core/context-compiler.js';
 import { applyPatch, createProjectSnapshot, createRunWorktree, ensureCleanWorkingTree, ensureGitRepo, gitDiff, repoSummary } from './core/repo.js';
 import { checkMissionCompletion } from './core/mission-check.js';
+import { runGeneratedAcceptanceTests } from './core/acceptance-tests.js';
 import { extractReviewVerdict, reviewVerdictBlocks } from './core/review-verdict.js';
 import { runValidation } from './core/validation.js';
 import { defaultAgents, selectAgents } from './agents/registry.js';
@@ -222,10 +223,13 @@ export class XdouOrchestrator {
 
   private async validateWorkspace(runId: string, mission: string, cwd: string, diff: string): Promise<ValidationResult[]> {
     const validation = await runValidation(cwd);
+    const generatedAcceptance = await runGeneratedAcceptanceTests(cwd, mission);
+    await this.store.writeJson(runId, 'generated-acceptance.json', generatedAcceptance);
     const missionCheck = checkMissionCompletion(mission, diff || 'No diff produced.');
     await this.store.writeJson(runId, 'mission-check.json', missionCheck);
     const combined: ValidationResult[] = [
       ...validation,
+      generatedAcceptance,
       {
         command: 'xdou mission-completion-check',
         status: missionCheck.status === 'failed' ? 'failed' : 'passed',
