@@ -32,6 +32,10 @@ function seedRun(cwd: string, id = '20260102030405-deadbeef'): string {
   writeFileSync(join(runDir, 'review-verdicts.json'), JSON.stringify([
     { agent: 'claude', verdict: 'request_changes', confidence: 0.9, reason: 'missing cockpit action bar', missingRequirements: ['action bar'] },
   ], null, 2));
+  writeFileSync(join(runDir, 'plan.md'), '## Plan\n1. Build visual cockpit panes\n2. Stream agent activity\n');
+  writeFileSync(join(runDir, 'diff.patch'), 'diff --git a/src/tui/cockpit.ts b/src/tui/cockpit.ts\n+visual panes\n');
+  mkdirSync(join(runDir, 'agents', 'codex'), { recursive: true });
+  writeFileSync(join(runDir, 'agents', 'codex', 'implementation-result.json'), JSON.stringify({ agent: 'codex', ok: true, stdout: 'Implemented cockpit pane layout and artifact previews.' }, null, 2));
   return id;
 }
 
@@ -50,6 +54,8 @@ describe('cockpit command', () => {
     expect(result.stdout).toContain('add terminal cockpit');
     expect(result.stdout).toContain('blocked/review');
     expect(result.stdout).toContain('claude: request_changes');
-    expect(result.stdout).toContain('[a] apply  [r] rerun  [v] view diff  [l] logs  [c] context  [q] quit');
+    expect(result.stdout).toContain('[tab] switch pane  [n] new mission  [v] diff  [p] plan  [r] review  [a] apply  [q] quit');
+    expect(result.stdout).toContain('plan.md');
+    expect(result.stdout).toContain('diff.patch');
   });
 });

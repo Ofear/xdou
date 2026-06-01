@@ -62,15 +62,38 @@ Global flags:
 
 ## Cockpit TUI
 
-`xdou cockpit` opens a terminal mission-control view over the existing artifact store. It does not replace `.xdou`; it reads run manifests, timeline events, review verdicts, artifact paths, and safe action hints from the same canonical files.
+`xdou cockpit` opens a visual terminal mission-control cockpit over the existing artifact store. It does not replace `.xdou`; it reads run manifests, timeline events, review verdicts, artifact previews, and safe apply/diff/review commands from `.xdou/runs/<run-id>`.
+
+The interactive cockpit now uses Pi TUI (`@earendil-works/pi-tui`) for a pane-based visual layout:
+
+- left: agent roster/status
+- center: live council/timeline transcript
+- right: current artifact preview (`plan.md`, `diff.patch`, `review.md`, `final-summary.md`)
+- bottom: action bar
 
 ```bash
-xdou cockpit              # interactive terminal cockpit
-xdou cockpit <run-id>     # inspect one run
-xdou cockpit --snapshot   # print once and exit for CI/logging
+xdou cockpit
+xdou cockpit <run-id>
 ```
 
-The cockpit defaults to high-signal operator context: current run status, mission, artifacts, review verdicts, recent timeline events, and safe commands such as `xdou apply <run-id>`.
+Keyboard:
+
+```text
+tab  switch pane focus
+v    show diff path
+p    show plan path
+r    show review path
+a    show apply command
+q    quit
+```
+
+For deterministic logs, CI, or terminals without TTY support:
+
+```bash
+xdou cockpit --snapshot
+```
+
+The long-term goal is a full visual multi-agent cockpit: agents speaking, planning, coding, reviewing, and acting through structured events. The next milestone is a canonical `.xdou/runs/<id>/events.ndjson` stream that powers both live TUI rendering and machine-readable automation.
 
 ## Safety model
 
