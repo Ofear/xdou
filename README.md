@@ -40,11 +40,14 @@ xdou agents detect
 xdou brainstorm "Design the implementation"
 xdou plan "Add GitHub OAuth login"
 xdou run "Add GitHub OAuth login" --max-fix-attempts 2
+xdou cockpit
+xdou cockpit --snapshot
 xdou status
 xdou status --json
 xdou runs list
 xdou runs list --json
 xdou context
+xdou apply <run-id>
 xdou config validate
 ```
 
@@ -56,6 +59,18 @@ Global flags:
 --agents a,b,c            Override team agents for brainstorm/plan/run
 --max-fix-attempts <n>    Maximum fixer iterations for xdou run
 ```
+
+## Cockpit TUI
+
+`xdou cockpit` opens a terminal mission-control view over the existing artifact store. It does not replace `.xdou`; it reads run manifests, timeline events, review verdicts, artifact paths, and safe action hints from the same canonical files.
+
+```bash
+xdou cockpit              # interactive terminal cockpit
+xdou cockpit <run-id>     # inspect one run
+xdou cockpit --snapshot   # print once and exit for CI/logging
+```
+
+The cockpit defaults to high-signal operator context: current run status, mission, artifacts, review verdicts, recent timeline events, and safe commands such as `xdou apply <run-id>`.
 
 ## Safety model
 
@@ -83,10 +98,16 @@ cat .xdou/runs/<run-id>/final-summary.md
 cat .xdou/runs/<run-id>/diff.patch
 ```
 
-Apply the patch manually if accepted:
+Apply the captured patch through xdou after review:
 
 ```bash
-git apply .xdou/runs/<run-id>/diff.patch
+xdou apply <run-id>
+```
+
+For manual inspection, the canonical patch remains available:
+
+```bash
+cat .xdou/runs/<run-id>/diff.patch
 ```
 
 Or inspect the isolated worktree directly:
@@ -109,7 +130,10 @@ Each run creates inspectable artifacts under `.xdou/runs/<run-id>/`, including:
 - `synthesis.md`
 - `diff.patch`
 - `validation.json`
+- `generated-acceptance.json`
+- `mission-check.json`
 - `review.md`
+- `review-verdicts.json`
 - `final-summary.md`
 - `timeline.ndjson`
 - `fixes/attempt-<n>/...` when fixer iterations run

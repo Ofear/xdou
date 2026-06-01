@@ -8,6 +8,7 @@ import { join } from 'node:path';
 import { XdouOrchestrator } from './orchestrator.js';
 import { defaultConfig, type TeamConfig } from './config/schema.js';
 import { loadConfig } from './config/load.js';
+import { launchCockpit, readCockpitState, renderCockpitSnapshot } from './tui/cockpit.js';
 
 class Xdou extends Command {
   static override description = 'xdou: multi-agent coding from your terminal';
@@ -17,6 +18,7 @@ class Xdou extends Command {
     json: Flags.boolean({ default: false }),
     agents: Flags.string({ description: 'Comma-separated agent ids for brainstorm/plan/run' }),
     'max-fix-attempts': Flags.integer({ default: 1, description: 'Maximum fixer iterations for run' }),
+    snapshot: Flags.boolean({ default: false, description: 'Render cockpit once and exit' }),
   };
 
   async run(): Promise<void> {
@@ -38,12 +40,13 @@ class Xdou extends Command {
       case 'status': await this.status(orchestrator, rest, flags.json); break;
       case 'runs': await this.runs(orchestrator, rest, flags.json); break;
       case 'context': await this.context(orchestrator, rest); break;
+      case 'cockpit': await this.cockpit(orchestrator, rest, flags.snapshot); break;
       case 'config': await this.configCommand(cwd, rest); break;
       case undefined:
       case 'help':
       case '--help':
       case '-h':
-        this.log('xdou: multi-agent coding from your terminal\n\nCommands:\n  init\n  agents [list|detect]\n  brainstorm <mission> [--agents a,b]\n  plan <mission>\n  run <mission> [--agents architect,implementer,reviewer] [--max-fix-attempts n] [--json]\n  apply <run-id> [--json]\n  status [run-id]\n  runs list\n  context [run-id]\n  config validate');
+        this.log('xdou: multi-agent coding from your terminal\n\nCommands:\n  init\n  agents [list|detect]\n  brainstorm <mission> [--agents a,b]\n  plan <mission>\n  run <mission> [--agents architect,implementer,reviewer] [--max-fix-attempts n] [--json]\n  apply <run-id> [--json]\n  cockpit [run-id] [--snapshot]\n  status [run-id]\n  runs list\n  context [run-id]\n  config validate');
         break;
       default: throw new Error(`Unknown command: ${cmd}. Try: xdou init | agents detect | brainstorm | plan | run | status | runs list | context | config validate`);
     }
@@ -168,6 +171,16 @@ class Xdou extends Command {
     if (!runId) throw new Error('No run id supplied and no previous run found.');
     const inboxPath = join(orchestrator.store.runDir(runId), 'agents');
     this.log(inboxPath);
+  }
+
+  private async cockpit(orchestrator: XdouOrchestrator, args: string[], snapshot: boolean): Promise<void> {
+    const runId = args.find((arg) => !arg.startsWith('-'));
+    const state = await readCockpitState(orchestrator.store, runId);
+    if (snapshot || !process.stdout.isTTY) {
+      this.log(renderCockpitSnapshot(state));
+      return;
+    }
+    await launchCockpit(state);
   }
 
   private async configCommand(cwd: string, args: string[]): Promise<void> {
