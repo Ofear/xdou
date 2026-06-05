@@ -1,6 +1,6 @@
 {
   "name": "@ofear/xdou",
-  "version": "1.2.0",
+  "version": "1.2.15",
   "description": "A terminal-native multi-agent development system where selected coding and architecture agents co-develop through council, synthesis, implementation, review, and validation loops.",
   "main": "dist/cli.js",
   "scripts": {
@@ -10,6 +10,7 @@
     "typecheck": "tsc --noEmit",
     "lint": "eslint src test --ext .ts",
     "prepublishOnly": "npm run lint && npm run typecheck && npm test && npm run build && npx publint",
+    "release:local": "npm run lint && npm run typecheck && npm test -- --run && npm run build && npx publint && npm pack --dry-run",
     "postbuild": "node -e \"try{require('fs').chmodSync('dist/cli.js',0o755)}catch{}\"",
     "prepack": "npm run build"
   },
@@ -68,7 +69,10 @@
   },
   "files": [
     "dist",
-    "README.md"
+    "README.md",
+    "terminal-bench/README.md",
+    "terminal-bench/xdou_agent.py",
+    "terminal-bench/xdou-setup.sh.j2"
   ],
   "exports": {
     ".": {
@@ -87,5 +91,9 @@
   "homepage": "https://github.com/Ofear/xdou#readme",
   "publishConfig": {
     "access": "public"
+  },
+  "directories": {
+    "doc": "docs",
+    "test": "test"
   }
 }

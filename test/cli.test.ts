@@ -39,6 +39,15 @@ function seedRun(cwd: string, id = '20260102030405-deadbeef'): string {
 }
 
 describe('CLI', () => {
+  it('supports conventional top-level help flags', async () => {
+    for (const flag of ['--help', '-h']) {
+      const result = await runCli([flag]);
+      expect(result.stdout).toContain('xdou: multi-agent coding from your terminal');
+      expect(result.stdout).toContain('Commands:');
+      expect(result.stdout).toContain('cockpit [run-id]');
+    }
+  });
+
   it('init creates config, artifact dirs, and gitignore safety entries', async () => {
     const cwd = await initGitRepo();
     const result = await runCli(['init', '--cwd', cwd]);
@@ -78,5 +87,39 @@ describe('CLI', () => {
     const result = await runCli(['plan', 'mission', '--agents', '--cwd', cwd], false);
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toMatch(/expects a value|requires a comma-separated value/);
+  });
+
+  it('rejects conversational CLI run prompts before project setup', async () => {
+    const cwd = await initGitRepo();
+    await runCli(['init', '--cwd', cwd]);
+
+    for (const prompt of ['what is this?', 'tell me a joke', 'what is in this repo', 'how does this work']) {
+      const result = await runCli(['run', ...prompt.split(' '), '--dry-run', '--cwd', cwd], false);
+
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toContain('That does not look like a coding mission yet.');
+      expect(result.stderr).toContain(`/ask ${prompt}`);
+    }
+  });
+
+  it('keeps dry-run plan preflight non-mutating in non-git directories', async () => {
+    const cwd = temporaryDirectory();
+
+    const result = await runCli(['plan', 'add', 'login', 'screen', '--dry-run', '--cwd', cwd]);
+
+    expect(result.stdout).toContain('plan preflight ok');
+    expect(existsSync(join(cwd, '.git'))).toBe(false);
+    expect(existsSync(join(cwd, '.gitignore'))).toBe(false);
+  });
+
+  it('rejects unsafe run ids before reading run artifacts', async () => {
+    const cwd = await initGitRepo();
+    await runCli(['init', '--cwd', cwd]);
+
+    const result = await runCli(['status', '../../escape', '--cwd', cwd], false);
+
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain('Invalid run id');
+    expect(result.stderr).toContain('YYYYMMDDHHMMSS-xxxxxxxx');
   });
 });

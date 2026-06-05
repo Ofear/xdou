@@ -38,6 +38,29 @@ class WritingAgent implements AgentAdapter {
   }
 }
 
+class TimeoutCapturingAgent implements AgentAdapter {
+  readonly type: AgentType = 'codex';
+  readonly command: string;
+  readonly inputs: AgentInput[] = [];
+
+  constructor(readonly id: string, readonly roles: AgentRole[]) {
+    this.command = `fake-${id}`;
+  }
+
+  buildInvocation(input: AgentInput): AgentInvocation {
+    return { command: this.command, args: [input.prompt], cwd: input.cwd, shell: false };
+  }
+
+  detect(): Promise<{ available: boolean; version: string }> {
+    return Promise.resolve({ available: true, version: 'fake' });
+  }
+
+  run(input: AgentInput): Promise<AgentRunResult> {
+    this.inputs.push(input);
+    return Promise.resolve({ agent: this.id, command: this.command, args: [input.prompt], exitCode: 0, stdout: `ok ${this.id}`, stderr: '', durationMs: 0, ok: true });
+  }
+}
+
 async function initGitRepo(cwd: string): Promise<void> {
   await execa('git', ['init'], { cwd });
   await execa('git', ['config', 'user.email', 'test@example.com'], { cwd });
@@ -72,5 +95,25 @@ describe('non-mutating agent isolation', () => {
     expect(existsSync(join(manifest.worktreePath!, 'non-mutating-agent-wrote.txt'))).toBe(false);
     expect(existsSync(join(manifest.worktreePath!, 'implementation-agent-wrote.txt'))).toBe(true);
     expect(existsSync(join(orchestrator.store.runDir(runId), 'project-snapshot', 'non-mutating-agent-wrote.txt'))).toBe(true);
+  });
+
+  it('gives autonomous agent calls a bounded default timeout so one slow agent cannot hang a live run indefinitely', async () => {
+    const cwd = temporaryDirectory();
+    await initGitRepo(cwd);
+    const claude = new TimeoutCapturingAgent('claude', ['brainstormer', 'critic', 'architect', 'reviewer']);
+    const codex = new TimeoutCapturingAgent('codex', ['brainstormer', 'implementer']);
+    const orchestrator = new XdouOrchestrator(cwd, '.xdou', {}, { claude, codex });
+
+    await orchestrator.run({
+      cwd,
+      mission: 'plan a bounded agent run',
+      execute: false,
+      team: ['claude', 'codex', 'claude'],
+      brainstormers: ['claude', 'codex'],
+      critics: ['claude'],
+    });
+
+    expect([...claude.inputs, ...codex.inputs].length).toBeGreaterThan(0);
+    expect([...claude.inputs, ...codex.inputs].every((input) => input.timeoutMs === 180_000)).toBe(true);
   });
 });

@@ -8,6 +8,10 @@ export async function isGitRepo(cwd: string): Promise<boolean> {
   const result = await execa('git', ['rev-parse', '--is-inside-work-tree'], { cwd, reject: false });
   return result.exitCode === 0 && result.stdout.trim() === 'true';
 }
+export async function hasGitHead(cwd: string): Promise<boolean> {
+  const result = await execa('git', ['rev-parse', '--verify', 'HEAD'], { cwd, reject: false });
+  return result.exitCode === 0;
+}
 export async function ensureGitRepo(cwd: string): Promise<void> { if (!(await isGitRepo(cwd))) throw new Error('xdou must run inside a git repository. Run git init first.'); }
 export async function isWorkingTreeClean(cwd: string): Promise<boolean> {
   const result = await execa('git', ['status', '--porcelain'], { cwd, reject: false });
@@ -62,14 +66,39 @@ export async function createProjectSnapshot(repoRoot: string, snapshotPath: stri
 }
 export interface ApplyPatchResult { filesChanged: number; files: string[] }
 
+function patchFiles(patch: string): string[] {
+  return [...patch.matchAll(/^diff --git a\/(.*?) b\/(.*?)$/gm)].map((match) => match[2]).filter((file): file is string => Boolean(file));
+}
+
 export async function applyPatch(cwd: string, patch: string): Promise<ApplyPatchResult> {
   if (!patch.trim() || patch.trim() === 'No diff produced.') throw new Error('Run has no diff to apply.');
   await ensureCleanWorkingTree(cwd);
-  const files = [...patch.matchAll(/^diff --git a\/(.*?) b\/(.*?)$/gm)].map((match) => match[2]).filter((file): file is string => Boolean(file));
+  const files = patchFiles(patch);
   const normalizedPatch = patch.endsWith('\n') ? patch : `${patch}\n`;
   await execa('git', ['apply', '--check', '-'], { cwd, input: normalizedPatch });
   await execa('git', ['apply', '-'], { cwd, input: normalizedPatch });
   return { filesChanged: new Set(files).size, files: [...new Set(files)] };
+}
+
+export async function reversePatch(cwd: string, patch: string): Promise<ApplyPatchResult> {
+  if (!patch.trim() || patch.trim() === 'No diff produced.') throw new Error('Run has no diff to reverse.');
+  const files = patchFiles(patch);
+  const patchFileSet = new Set(files);
+  const status = await execa('git', ['status', '--porcelain'], { cwd, reject: false });
+  const unrelatedDirty = status.stdout.split(/\r?\n/).filter(Boolean).map((line) => line.slice(3).replace(/^"|"$/g, '')).filter((file) => !patchFileSet.has(file));
+  if (unrelatedDirty.length) throw new Error(`Refusing to undo with unrelated dirty working tree files: ${unrelatedDirty.join(', ')}. Commit/stash changes first.`);
+  const normalizedPatch = patch.endsWith('\n') ? patch : `${patch}\n`;
+  await execa('git', ['apply', '--reverse', '--check', '-'], { cwd, input: normalizedPatch });
+  await execa('git', ['apply', '--reverse', '-'], { cwd, input: normalizedPatch });
+  return { filesChanged: new Set(files).size, files: [...new Set(files)] };
+}
+
+export async function removeRunWorktree(repoRoot: string, worktreePath: string): Promise<void> {
+  const listed = await execa('git', ['worktree', 'list', '--porcelain'], { cwd: repoRoot, reject: false });
+  const normalized = worktreePath.replace(/\\/g, '/');
+  const isRegistered = listed.stdout.split(/\r?\n/).some((line) => line.startsWith('worktree ') && line.slice('worktree '.length).replace(/\\/g, '/') === normalized);
+  if (isRegistered) await execa('git', ['worktree', 'remove', '--force', worktreePath], { cwd: repoRoot, reject: false });
+  await fs.remove(worktreePath);
 }
 
 export async function repoSummary(cwd: string): Promise<string> {

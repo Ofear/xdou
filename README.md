@@ -80,12 +80,19 @@ Keyboard:
 
 ```text
 tab  switch pane focus
+enter send composer prompt
+p    start /plan prompt
 v    show diff path
-p    show plan path
 r    show review path
-a    show apply command
+t    rerun tests
+f    fix blockers
+u    undo applied run
+d    discard run
+a    apply generated patch
 q    quit
 ```
+
+Prompt commands shown in the action bar: `/ask /find /web /plan /code /test /fix /apply /undo`.
 
 For deterministic logs, CI, or terminals without TTY support:
 

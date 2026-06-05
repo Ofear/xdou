@@ -14,6 +14,23 @@ describe('structured review verdicts', () => {
     expect(reviewVerdictBlocks(verdict)).toBe(true);
   });
 
+  it('extracts verdicts from JSON agent envelopes before scanning raw escaped output', () => {
+    const envelope = JSON.stringify({
+      type: 'result',
+      result: 'Verified on disk.\n\nREVIEW_VERDICT:\n{"verdict":"approve","confidence":0.97,"reason":"verified green","missingRequirements":[]}',
+    });
+
+    const verdict = extractReviewVerdict(envelope);
+
+    expect(verdict).toEqual({
+      verdict: 'approve',
+      confidence: 0.97,
+      reason: 'verified green',
+      missingRequirements: [],
+    });
+    expect(reviewVerdictBlocks(verdict)).toBe(false);
+  });
+
   it('treats malformed or absent verdicts as blocking semantic review failures', () => {
     const verdict = extractReviewVerdict('Looks fine, no machine verdict.');
 

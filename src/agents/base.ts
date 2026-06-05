@@ -2,6 +2,18 @@ import { execa } from 'execa';
 import which from 'which';
 import type { AgentAdapter, AgentInput, AgentInvocation, AgentRole, AgentRunResult, AgentType } from '../types.js';
 
+export function sanitizeAgentText(value: string): string {
+  return value.replace(/\0/g, '');
+}
+
+function sanitizeInvocation(invocation: AgentInvocation): AgentInvocation {
+  return {
+    ...invocation,
+    args: invocation.args.map(sanitizeAgentText),
+    ...(invocation.stdin ? { stdin: sanitizeAgentText(invocation.stdin) } : {}),
+  };
+}
+
 export abstract class CliAgentAdapter implements AgentAdapter {
   abstract readonly id: string;
   abstract readonly type: AgentType;
@@ -26,7 +38,7 @@ export abstract class CliAgentAdapter implements AgentAdapter {
   }
 
   async run(input: AgentInput): Promise<AgentRunResult> {
-    const invocation = this.buildInvocation(input);
+    const invocation = sanitizeInvocation(this.buildInvocation(input));
     const started = Date.now();
     try {
       const options = {

@@ -8,10 +8,11 @@ export interface ReviewVerdict {
 }
 
 export function extractReviewVerdict(output: string): ReviewVerdict {
-  const marker = /REVIEW_VERDICT\s*:/i.exec(output);
+  const normalizedOutput = normalizeAgentOutput(output);
+  const marker = /REVIEW_VERDICT\s*:/i.exec(normalizedOutput);
   if (!marker) return blockedVerdict('Reviewer output missing REVIEW_VERDICT JSON block.');
 
-  const tail = output.slice(marker.index + marker[0].length).trim();
+  const tail = normalizedOutput.slice(marker.index + marker[0].length).trim();
   const json = extractFirstJsonObject(tail);
   if (!json) return blockedVerdict('Reviewer output has REVIEW_VERDICT marker but no JSON object.');
 
@@ -43,6 +44,22 @@ function isReviewDecision(value: unknown): value is ReviewDecision {
 
 function clampConfidence(value: unknown): number {
   return typeof value === 'number' && Number.isFinite(value) ? Math.min(1, Math.max(0, value)) : 0;
+}
+
+function normalizeAgentOutput(output: string): string {
+  const trimmed = output.trim();
+  if (!trimmed.startsWith('{')) return output;
+
+  try {
+    const parsed = JSON.parse(trimmed) as { result?: unknown; message?: unknown; content?: unknown };
+    for (const value of [parsed.result, parsed.message, parsed.content]) {
+      if (typeof value === 'string' && /REVIEW_VERDICT\s*:/i.test(value)) return value;
+    }
+  } catch {
+    return output;
+  }
+
+  return output;
 }
 
 function extractFirstJsonObject(text: string): string | undefined {

@@ -3,11 +3,12 @@ import fs from 'fs-extra';
 import { join } from 'node:path';
 import { ArtifactStore } from './core/artifact-store.js';
 import { compileContextPacket } from './core/context-compiler.js';
-import { applyPatch, createProjectSnapshot, createRunWorktree, ensureCleanWorkingTree, ensureGitRepo, gitDiff, repoSummary } from './core/repo.js';
+import { applyPatch, createProjectSnapshot, createRunWorktree, currentHead, ensureCleanWorkingTree, ensureGitRepo, gitDiff, removeRunWorktree, repoSummary, reversePatch } from './core/repo.js';
 import { checkMissionCompletion } from './core/mission-check.js';
 import { runGeneratedAcceptanceTests } from './core/acceptance-tests.js';
 import { extractReviewVerdict, reviewVerdictBlocks } from './core/review-verdict.js';
 import { runValidation } from './core/validation.js';
+import { appendCollaborationEvent, initializeCollaboration, publishLiveNote, readCollaborationState, recordPatchDeltas, sendAgentMessage } from './core/live-collaboration.js';
 import { defaultAgents, selectAgents } from './agents/registry.js';
 import type { AgentAdapter, AgentRunResult, ValidationResult } from './types.js';
 import type { ReviewVerdict } from './core/review-verdict.js';
@@ -30,6 +31,12 @@ export interface RunOptions {
 
 interface CouncilOutput { agent: string; role: 'brainstormer' | 'critic'; result: AgentRunResult }
 interface ReviewOutput { agent: string; result: AgentRunResult; verdict: ReviewVerdict }
+
+const DEFAULT_AGENT_TIMEOUT_MS = 180_000;
+
+function agentTimeout(timeoutMs?: number): number {
+  return timeoutMs ?? DEFAULT_AGENT_TIMEOUT_MS;
+}
 
 export class XdouOrchestrator {
   readonly cwd: string;
@@ -59,6 +66,7 @@ export class XdouOrchestrator {
     const project = await repoSummary(this.cwd);
     const snapshotCwd = await createProjectSnapshot(this.cwd, join(this.store.runDir(run.id), 'project-snapshot'));
     await this.store.writeText(run.id, 'project.md', project || 'No common project metadata found.');
+    await initializeCollaboration(this.store, run.id, names.map((id) => ({ id, role: 'brainstormer' })));
     const council = await this.runCouncil(run.id, mission, project, snapshotCwd, names, []);
     const councilText = this.formatCouncil(council);
     await this.store.writeText(run.id, 'brainstorm.md', councilText);
@@ -85,13 +93,29 @@ export class XdouOrchestrator {
     const brainstormers = options.brainstormers ?? [architect.id, implementer.id];
     const critics = options.critics ?? [];
     const reviewerNames = options.reviewers ?? [fallbackReviewer.id];
+    const collaborationAgents = [
+      { id: architect.id, role: 'architect' },
+      { id: implementer.id, role: 'implementer' },
+      ...reviewerNames.map((id) => ({ id, role: 'reviewer' })),
+      ...brainstormers.map((id) => ({ id, role: 'brainstormer' })),
+      ...critics.map((id) => ({ id, role: 'critic' })),
+    ].filter((agent, index, all) => all.findIndex((other) => other.id === agent.id && other.role === agent.role) === index);
+    await initializeCollaboration(this.store, run.id, collaborationAgents);
     const council = await this.runCouncil(run.id, options.mission, project, snapshotCwd, brainstormers, critics, options.timeoutMs);
     const councilText = this.formatCouncil(council);
     await this.store.writeText(run.id, 'council.md', councilText || 'No council agents configured.');
 
     await this.store.updateManifest(run.id, { phase: 'planning' });
+    await publishLiveNote(this.store, run.id, architect.id, 'architect', {
+      intent: 'Synthesize reciprocal council outputs into one canonical implementation direction.',
+      approach: 'Compare peer proposals, promote accepted decisions, record rejected approaches, and prepare implementer steering context.',
+      assumptions: ['Council outputs are explicit artifacts, not hidden reasoning.'],
+      risks: ['Weak synthesis can let implementer drift from peer warnings.'],
+      changeTriggers: ['Peer critique identifies a safer or simpler architecture.'],
+    });
+    const collaborationBeforePlan = await this.collaborationBrief(run.id);
     const synthesisPrompt = [
-      compileContextPacket({ runId: run.id, agent: architect.id, role: 'architect', mission: options.mission, projectContext: project, budget: 'balanced' }),
+      compileContextPacket({ runId: run.id, agent: architect.id, role: 'architect', mission: options.mission, projectContext: project, budget: 'balanced', collaboration: collaborationBeforePlan }),
       '',
       'CO-DEVELOPMENT COUNCIL INPUTS:',
       councilText || 'No council inputs.',
@@ -99,7 +123,7 @@ export class XdouOrchestrator {
       'SYNTHESIS CONTRACT:',
       'Create one canonical plan that selects the strongest ideas, resolves disagreements, lists risks, and gives the implementer precise execution steps.',
     ].join('\n');
-    const planInput = { cwd: snapshotCwd, runDir: this.store.runDir(run.id), prompt: synthesisPrompt, ...(options.timeoutMs ? { timeoutMs: options.timeoutMs } : {}) };
+    const planInput = { cwd: snapshotCwd, runDir: this.store.runDir(run.id), prompt: synthesisPrompt, timeoutMs: agentTimeout(options.timeoutMs) };
     const planResult = await architect.run(planInput);
     const rawPlan = planResult.stdout || planResult.stderr;
     const synthesis = this.formatSynthesis(architect.id, rawPlan, council);
@@ -112,19 +136,31 @@ export class XdouOrchestrator {
 
     const workspace = options.isolated === false ? { cwd: this.cwd } : await createRunWorktree(this.cwd, run.id);
     await this.store.updateManifest(run.id, { phase: 'implementation', ...(workspace.worktreePath ? { worktreePath: workspace.worktreePath, baseRef: workspace.baseRef } : {}) });
-    const implPrompt = compileContextPacket({ runId: run.id, agent: implementer.id, role: 'implementer', mission: options.mission, projectContext: project, plan: synthesis, budget: 'balanced' });
-    const implInput = { cwd: workspace.cwd, runDir: this.store.runDir(run.id), prompt: implPrompt, ...(options.timeoutMs ? { timeoutMs: options.timeoutMs } : {}) };
+    await publishLiveNote(this.store, run.id, implementer.id, 'implementer', {
+      intent: 'Implement the canonical plan while exposing live direction and planned file touches for peer review.',
+      approach: 'Follow synthesis, keep edits scoped to the worktree, read inbox warnings, and report any deviations.',
+      assumptions: ['Reviewers may inspect live notes and patch deltas before final review.'],
+      nextFiles: ['See canonical plan and generated diff.'],
+      risks: ['Changing files outside the plan or missing tests.'],
+      changeTriggers: ['Reviewer emits warning/blocker, validation fails, or implementation conflicts with accepted decisions.'],
+    });
+    await appendCollaborationEvent(this.store, run.id, { type: 'agent.round.started', from: implementer.id, role: 'implementer', message: 'Implementation round started; peers can watch live notes and patch deltas.' });
+    const implPrompt = compileContextPacket({ runId: run.id, agent: implementer.id, role: 'implementer', mission: options.mission, projectContext: project, plan: synthesis, budget: 'balanced', collaboration: await this.collaborationBrief(run.id) });
+    const implInput = { cwd: workspace.cwd, runDir: this.store.runDir(run.id), prompt: implPrompt, timeoutMs: agentTimeout(options.timeoutMs) };
     const implResult = await implementer.run(implInput);
     await this.store.writeJson(run.id, `agents/${implementer.id}/implementation-result.json`, implResult);
     await this.store.appendEvent(run.id, { type: 'implementation.finished', by: implementer.id, ok: implResult.ok });
 
     let diff = await gitDiff(workspace.cwd);
     await this.store.writeText(run.id, 'diff.patch', diff || 'No diff produced.');
+    await recordPatchDeltas(this.store, run.id, implementer.id, diff);
+    await appendCollaborationEvent(this.store, run.id, { type: 'agent.round.finished', from: implementer.id, role: 'implementer', message: diff ? 'Implementation produced patch deltas for live peer review.' : 'Implementation finished without a diff.', severity: diff ? 'info' : 'warning' });
     let validation = await this.validateWorkspace(run.id, options.mission, workspace.cwd, diff);
     await this.store.appendEvent(run.id, { type: 'validation.finished', ok: !validation.some((v) => v.status === 'failed') });
 
     await this.store.updateManifest(run.id, { phase: 'review' });
-    let reviewResults = await this.runReviews(run.id, snapshotCwd, options.mission, synthesis, diff, validation, reviewerNames, options.timeoutMs);
+    const reviewSnapshotCwd = await createProjectSnapshot(workspace.cwd, join(this.store.runDir(run.id), 'review-snapshot'));
+    let reviewResults = await this.runReviews(run.id, reviewSnapshotCwd, options.mission, synthesis, diff, validation, reviewerNames, options.timeoutMs);
     let failed = this.hasBlockers(implResult, validation, reviewResults);
 
     const maxFixAttempts = options.maxFixAttempts ?? 1;
@@ -147,17 +183,19 @@ export class XdouOrchestrator {
         ...(lastValidation ? { validation: lastValidation } : {}),
       });
       await this.store.writeText(run.id, `fixes/attempt-${attempt}/inbox.md`, fixPrompt);
-      const fixInput = { cwd: workspace.cwd, runDir: this.store.runDir(run.id), prompt: fixPrompt, ...(options.timeoutMs ? { timeoutMs: options.timeoutMs } : {}) };
+      const fixInput = { cwd: workspace.cwd, runDir: this.store.runDir(run.id), prompt: fixPrompt, timeoutMs: agentTimeout(options.timeoutMs) };
       const fixResult = await fixer.run(fixInput);
       await this.store.writeJson(run.id, `fixes/attempt-${attempt}/result.json`, fixResult);
       await this.store.appendEvent(run.id, { type: 'fix.finished', by: fixer.id, attempt, ok: fixResult.ok });
       diff = await gitDiff(workspace.cwd);
       await this.store.writeText(run.id, `fixes/attempt-${attempt}/diff.patch`, diff || 'No diff produced.');
       await this.store.writeText(run.id, 'diff.patch', diff || 'No diff produced.');
+      await recordPatchDeltas(this.store, run.id, fixer.id, diff);
       validation = await this.validateWorkspace(run.id, options.mission, workspace.cwd, diff);
       await this.store.writeJson(run.id, `fixes/attempt-${attempt}/validation.json`, validation);
       await this.store.appendEvent(run.id, { type: 'validation.finished', attempt, ok: !validation.some((v) => v.status === 'failed') });
-      reviewResults = await this.runReviews(run.id, snapshotCwd, options.mission, synthesis, diff, validation, reviewerNames, options.timeoutMs);
+      const fixReviewSnapshotCwd = await createProjectSnapshot(workspace.cwd, join(this.store.runDir(run.id), `fixes/attempt-${attempt}/review-snapshot`));
+      reviewResults = await this.runReviews(run.id, fixReviewSnapshotCwd, options.mission, synthesis, diff, validation, reviewerNames, options.timeoutMs);
       failed = this.hasBlockers(fixResult, validation, reviewResults);
     }
     if (failed && maxFixAttempts > 0) await this.store.appendEvent(run.id, { type: 'fix.exhausted', attempts: maxFixAttempts });
@@ -173,6 +211,10 @@ export class XdouOrchestrator {
     await ensureGitRepo(this.cwd);
     const manifest = await this.store.readManifest(runId);
     if (manifest.status !== 'completed') throw new Error(`Refusing to apply run ${runId} with status ${manifest.status}.`);
+    if (manifest.baseRef) {
+      const head = await currentHead(this.cwd);
+      if (head !== manifest.baseRef) throw new Error(`Run ${runId} was based on ${manifest.baseRef}, but current HEAD is ${head}. Review/re-run before applying stale worktree output.`);
+    }
     const diffPath = join(this.store.runDir(runId), 'diff.patch');
     const diff = await fs.readFile(diffPath, 'utf8');
     const applied = await applyPatch(this.cwd, diff);
@@ -181,6 +223,53 @@ export class XdouOrchestrator {
     await this.store.appendEvent(runId, { type: 'run.applied', by: 'xdou', filesChanged: applied.filesChanged });
     await this.store.updateManifest(runId, { appliedAt: new Date().toISOString() });
     return result;
+  }
+
+  async undoRun(runId: string): Promise<{ runId: string; undone: true; filesChanged: number; files: string[]; artifactDir: string }> {
+    await ensureGitRepo(this.cwd);
+    const manifest = await this.store.readManifest(runId);
+    if (!manifest.appliedAt) throw new Error(`Run ${runId} has not been applied; nothing to undo.`);
+    const diffPath = join(this.store.runDir(runId), 'diff.patch');
+    const diff = await fs.readFile(diffPath, 'utf8');
+    const undone = await reversePatch(this.cwd, diff);
+    const result = { runId, undone: true as const, filesChanged: undone.filesChanged, files: undone.files, artifactDir: manifest.artifactDir };
+    await this.store.writeJson(runId, 'undo-result.json', result);
+    await this.store.appendEvent(runId, { type: 'run.undone', by: 'xdou', filesChanged: undone.filesChanged });
+    const updated = await this.store.readManifest(runId);
+    delete updated.appliedAt;
+    await this.store.writeJson(runId, 'manifest.json', { ...updated, updatedAt: new Date().toISOString() });
+    return result;
+  }
+
+  async discardRun(runId: string): Promise<{ runId: string; discarded: true; worktreePath?: string; artifactDir: string }> {
+    await ensureGitRepo(this.cwd);
+    const manifest = await this.store.readManifest(runId);
+    if (manifest.worktreePath) await removeRunWorktree(this.cwd, manifest.worktreePath);
+    const result = { runId, discarded: true as const, ...(manifest.worktreePath ? { worktreePath: manifest.worktreePath } : {}), artifactDir: manifest.artifactDir };
+    await this.store.writeJson(runId, 'discard-result.json', result);
+    await this.store.appendEvent(runId, { type: 'run.discarded', by: 'xdou' });
+    const updated = await this.store.readManifest(runId);
+    delete updated.worktreePath;
+    await this.store.writeJson(runId, 'manifest.json', { ...updated, phase: 'discarded', updatedAt: new Date().toISOString() });
+    return result;
+  }
+
+  async rerunValidation(runId: string): Promise<{ runId: string; validation: ValidationResult[]; artifactDir: string }> {
+    const manifest = await this.store.readManifest(runId);
+    const validationCwd = manifest.worktreePath && await fs.pathExists(manifest.worktreePath) ? manifest.worktreePath : this.cwd;
+    const validation = await runValidation(validationCwd);
+    const result = { runId, validation, artifactDir: manifest.artifactDir };
+    await this.store.writeJson(runId, 'validation-rerun.json', validation);
+    await this.store.appendEvent(runId, { type: 'validation.rerun', by: 'xdou', ok: !validation.some((item) => item.status === 'failed') });
+    return result;
+  }
+
+  async collaboration(runId: string): Promise<Awaited<ReturnType<typeof readCollaborationState>>> {
+    return readCollaborationState(this.store, runId);
+  }
+
+  async messageAgent(runId: string, from: string, to: string, message: string, severity: 'info' | 'suggestion' | 'warning' | 'blocker' = 'suggestion'): Promise<void> {
+    await sendAgentMessage(this.store, runId, from, to, message, severity);
   }
 
   private async runCouncil(runId: string, mission: string, project: string, cwd: string, brainstormers: string[], critics: string[], timeoutMs?: number): Promise<CouncilOutput[]> {
@@ -193,32 +282,87 @@ export class XdouOrchestrator {
       if (!agent) return undefined;
       const prompt = compileContextPacket({ runId, agent: agent.id, role: spec.role, mission, projectContext: project, budget: 'balanced' });
       await this.store.writeText(runId, `agents/${agent.id}/${spec.role}-inbox.md`, prompt);
-      const input = { cwd, runDir: this.store.runDir(runId), prompt, ...(timeoutMs ? { timeoutMs } : {}) };
+      const input = { cwd, runDir: this.store.runDir(runId), prompt, timeoutMs: agentTimeout(timeoutMs) };
       const result = await agent.run(input);
       await this.store.writeJson(runId, `agents/${agent.id}/${spec.role}-result.json`, result);
       await this.store.appendEvent(runId, { type: 'council.finished', by: agent.id, role: spec.role, ok: result.ok, exitCode: result.exitCode });
       return { agent: agent.id, role: spec.role, result };
     }));
-    return outputs.filter((output): output is CouncilOutput => Boolean(output));
+    const firstRound = outputs.filter((output): output is CouncilOutput => Boolean(output));
+    if (firstRound.length > 1) {
+      await appendCollaborationEvent(this.store, runId, { type: 'agent.round.started', from: 'xdou', role: 'council', round: 2, message: 'Reciprocal council response round started.' });
+      const peerText = this.formatCouncil(firstRound);
+      const secondRound = await Promise.all(firstRound.map(async (entry): Promise<CouncilOutput | undefined> => {
+        const [agent] = selectAgents([entry.agent], this.agents);
+        if (!agent) return undefined;
+        const prompt = compileContextPacket({
+          runId,
+          agent: agent.id,
+          role: 'council-responder',
+          mission,
+          projectContext: project,
+          budget: 'balanced',
+          collaboration: await this.collaborationBrief(runId),
+          peerNotes: [
+            'RECIPROCAL CO-BRAINSTORMING ROUND:',
+            'Read the other agents explicit proposals below. Respond with: agreements, disagreements, missed risks, better direction, and what should be promoted into canonical decisions.',
+            '',
+            peerText,
+          ].join('\n'),
+        });
+        await this.store.writeText(runId, `agents/${agent.id}/${entry.role}-reciprocal-inbox.md`, prompt);
+        const result = await agent.run({ cwd, runDir: this.store.runDir(runId), prompt, timeoutMs: agentTimeout(timeoutMs) });
+        await this.store.writeJson(runId, `agents/${agent.id}/${entry.role}-reciprocal-result.json`, result);
+        await appendCollaborationEvent(this.store, runId, { type: 'agent.round.finished', from: agent.id, role: entry.role, round: 2, message: 'Reciprocal council response finished.', severity: result.ok ? 'info' : 'warning' });
+        return { agent: agent.id, role: entry.role, result };
+      }));
+      return [...firstRound, ...secondRound.filter((output): output is CouncilOutput => Boolean(output))];
+    }
+    return firstRound;
   }
 
   private async runReviews(runId: string, cwd: string, mission: string, plan: string, diff: string, validation: ValidationResult[], reviewers: string[], timeoutMs?: number): Promise<ReviewOutput[]> {
     const lastValidation = validation.at(-1);
     const outputs = await Promise.all(selectAgents(reviewers, this.agents).map(async (reviewer): Promise<ReviewOutput> => {
-      const reviewContext = { runId, agent: reviewer.id, role: 'reviewer', mission, plan, diff, budget: 'minimal' as const, ...(lastValidation ? { validation: lastValidation } : {}) };
+      const reviewContext = { runId, agent: reviewer.id, role: 'reviewer', mission, plan, diff, budget: 'minimal' as const, collaboration: await this.collaborationBrief(runId), peerNotes: 'Watch live patch deltas and implementer live notes before issuing final verdict. Convert drift into warning/blocker with concrete file-level guidance.', ...(lastValidation ? { validation: lastValidation } : {}) };
       const prompt = compileContextPacket(reviewContext);
       await this.store.writeText(runId, `agents/${reviewer.id}/review-inbox.md`, prompt);
-      const input = { cwd, runDir: this.store.runDir(runId), prompt, ...(timeoutMs ? { timeoutMs } : {}) };
+      const input = { cwd, runDir: this.store.runDir(runId), prompt, timeoutMs: agentTimeout(timeoutMs) };
       const result = await reviewer.run(input);
       const verdict = extractReviewVerdict(result.stdout || result.stderr);
       await this.store.writeJson(runId, `agents/${reviewer.id}/review-result.json`, result);
       await this.store.writeJson(runId, `agents/${reviewer.id}/review-verdict.json`, verdict);
       await this.store.appendEvent(runId, { type: 'review.finished', by: reviewer.id, ok: result.ok, verdict: verdict.verdict });
+      if (verdict.verdict === 'blocked') await sendAgentMessage(this.store, runId, reviewer.id, 'implementer', verdict.reason, 'blocker');
+      else if (verdict.verdict === 'request_changes') await sendAgentMessage(this.store, runId, reviewer.id, 'implementer', verdict.reason, 'warning');
       return { agent: reviewer.id, result, verdict };
     }));
     await this.store.writeText(runId, 'review.md', outputs.map((review) => `## ${review.agent}\n\n${review.result.stdout || review.result.stderr}`).join('\n\n---\n\n'));
     await this.store.writeJson(runId, 'review-verdicts.json', outputs.map((review) => ({ agent: review.agent, ...review.verdict })));
     return outputs;
+  }
+
+  private async collaborationBrief(runId: string): Promise<string> {
+    const state = await readCollaborationState(this.store, runId);
+    const events = state.events.slice(-12).map((event) => {
+      const to = event.to ? ` -> ${event.to}` : '';
+      const severity = event.severity ? ` [${event.severity}]` : '';
+      const file = event.file ? ` ${event.file}` : '';
+      return `- ${event.type}${severity}: ${event.from}${to}${file}${event.message ? ` — ${event.message}` : ''}`;
+    });
+    const agentNotes = state.agents.slice(0, 8).flatMap((agent) => [
+      `## ${agent.id}`,
+      ...agent.liveNotes.slice(0, 8).map((line) => `  ${line}`),
+      ...agent.warnings.slice(-3).map((warning) => `  WARNING from ${warning.from}: ${warning.message ?? warning.type}`),
+    ]);
+    return [
+      'Shared room: agents collaborate via explicit notes, live patch deltas, warnings/blockers, and inbox/outbox messages.',
+      'Recent events:',
+      ...(events.length ? events : ['- none yet']),
+      '',
+      'Agent live notes:',
+      ...(agentNotes.length ? agentNotes : ['- none yet']),
+    ].join('\n');
   }
 
   private async validateWorkspace(runId: string, mission: string, cwd: string, diff: string): Promise<ValidationResult[]> {
@@ -230,6 +374,12 @@ export class XdouOrchestrator {
     const combined: ValidationResult[] = [
       ...validation,
       generatedAcceptance,
+      {
+        command: 'xdou diff-required-check',
+        status: diff.trim() ? 'passed' : 'failed',
+        output: diff.trim() ? 'Worktree diff produced.' : 'No worktree diff was produced; refusing to mark a mutating run completed because there is nothing to apply.',
+        exitCode: diff.trim() ? 0 : 1,
+      },
       {
         command: 'xdou mission-completion-check',
         status: missionCheck.status === 'failed' ? 'failed' : 'passed',

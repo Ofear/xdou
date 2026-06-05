@@ -66,6 +66,24 @@ describe('worktree isolation and fix loop', () => {
     expect(manifest.status).toBe('completed');
   });
 
+  it('blocks completed status when implementer produces no worktree diff', async () => {
+    const cwd = temporaryDirectory();
+    await initGitRepo(cwd, 'node -e "process.exit(0)"');
+    const orchestrator = new XdouOrchestrator(cwd, '.xdou', {}, {
+      claude: new ScriptedAgent('claude', ['brainstormer', 'architect', 'reviewer'], () => undefined),
+      codex: new ScriptedAgent('codex', ['implementer'], () => undefined),
+    });
+
+    const runId = await orchestrator.run({ cwd, mission: 'create a tiny greet CLI project', team: ['claude', 'codex', 'claude'], maxFixAttempts: 0 });
+    const runDir = orchestrator.store.runDir(runId);
+    const manifest = JSON.parse(readFileSync(join(runDir, 'manifest.json'), 'utf8')) as { status: string; phase: string };
+    const validation = readFileSync(join(runDir, 'validation.json'), 'utf8');
+
+    expect(manifest).toEqual(expect.objectContaining({ status: 'blocked', phase: 'needs_attention' }));
+    expect(validation).toContain('xdou diff-required-check');
+    expect(validation).toContain('No worktree diff was produced');
+  });
+
   it('runs fixer after validation failure and completes when validation passes', async () => {
     const cwd = temporaryDirectory();
     await initGitRepo(cwd);

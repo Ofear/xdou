@@ -6,8 +6,16 @@ import type { RunManifest } from '../types.js';
 
 export class ArtifactStore {
   readonly root: string;
+  private readonly eventQueues = new Map<string, Promise<void>>();
   constructor(root: string) { this.root = root; }
-  runDir(runId: string): string { return join(this.root, 'runs', runId); }
+  runDir(runId: string): string {
+    this.assertValidRunId(runId);
+    return join(this.root, 'runs', runId);
+  }
+
+  private assertValidRunId(runId: string): void {
+    if (!/^\d{14}-[a-f0-9]{8}$/.test(runId)) throw new Error(`Invalid run id "${runId}". Expected YYYYMMDDHHMMSS-xxxxxxxx.`);
+  }
 
   async createRun(mission: string): Promise<RunManifest> {
     const id = `${new Date().toISOString().replace(/[-:.TZ]/g, '').slice(0, 14)}-${randomUUID().slice(0, 8)}`;
@@ -50,6 +58,13 @@ export class ArtifactStore {
   }
 
   async appendEvent(runId: string, event: Record<string, unknown>): Promise<void> {
+    const prior = this.eventQueues.get(runId) ?? Promise.resolve();
+    const next = prior.then(() => this.appendEventUnlocked(runId, event));
+    this.eventQueues.set(runId, next.catch(() => undefined));
+    await next;
+  }
+
+  private async appendEventUnlocked(runId: string, event: Record<string, unknown>): Promise<void> {
     const path = join(this.runDir(runId), 'timeline.ndjson');
     await fs.ensureDir(join(path, '..'));
     const enriched = { time: new Date().toISOString(), ...event };

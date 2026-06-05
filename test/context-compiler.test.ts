@@ -26,6 +26,9 @@ describe('compileContextPacket', () => {
     expect(packet).toContain('ROLE: implementer');
     expect(packet).toContain('TASK task-1: Add callback route');
     expect(packet).toContain('Use existing session middleware');
+    expect(packet).toContain('IMPLEMENTATION CONTRACT');
+    expect(packet).toContain('git diff HEAD -- .');
+    expect(packet).toContain('project-snapshot, council artifacts, or plan text as delivered code');
     expect(packet).not.toContain('RAW SECRET CHAT');
   });
 
@@ -36,11 +39,19 @@ describe('compileContextPacket', () => {
       role: 'reviewer',
       diff: 'diff --git a/a.ts b/a.ts',
       validation: { command: 'npm test', status: 'failed', output: '1 failed' },
+      collaboration: 'Shared room: codex live note says editing a.ts',
+      peerNotes: 'codex risk: missing tests',
+      inboxSummary: 'warning from architect',
       budget: 'minimal',
     });
 
     expect(packet).toContain('DIFF TO REVIEW');
     expect(packet).toContain('npm test');
     expect(packet).toContain('1 failed');
+    expect(packet).toContain('LIVE RECIPROCAL COLLABORATION CONTRACT');
+    expect(packet).toContain('Shared room: codex live note');
+    expect(packet).toContain('PEER LIVE NOTES');
+    expect(packet).toContain('warning from architect');
+    expect(packet).toContain('Do not expose or request private hidden chain-of-thought');
   });
 });

@@ -30,7 +30,8 @@ describe('apply command and machine-readable output', () => {
     const runId = '20260102030405-deadbeef';
     const runDir = join(cwd, '.xdou', 'runs', runId);
     const worktreePath = join(cwd, '.xdou', 'worktrees', runId);
-    await execa('git', ['worktree', 'add', '--detach', worktreePath, 'HEAD'], { cwd });
+    const baseRef = (await execa('git', ['rev-parse', 'HEAD'], { cwd })).stdout.trim();
+    await execa('git', ['worktree', 'add', '--detach', worktreePath, baseRef], { cwd });
     writeFileSync(join(worktreePath, 'app.txt'), 'base\napplied\n');
     const diff = await execa('git', ['diff', 'HEAD', '--', '.'], { cwd: worktreePath });
     mkdirSync(runDir, { recursive: true });
@@ -45,7 +46,7 @@ describe('apply command and machine-readable output', () => {
       artifactDir: runDir,
       events: 3,
       worktreePath,
-      baseRef: 'HEAD'
+      baseRef,
     }, null, 2));
 
     const result = await runCli(['apply', runId, '--json', '--cwd', cwd]);
@@ -54,6 +55,41 @@ describe('apply command and machine-readable output', () => {
     expect(payload).toEqual(expect.objectContaining({ applied: true, runId, filesChanged: 1 }));
     expect(readFileSync(join(cwd, 'app.txt'), 'utf8').replace(/\r\n/g, '\n')).toBe('base\napplied\n');
     expect(existsSync(join(runDir, 'apply-result.json'))).toBe(true);
+  });
+
+  it('refuses to apply a run whose base ref no longer matches the operator checkout', async () => {
+    const cwd = await initGitRepo();
+    const runId = '20260104030405-cafebabe';
+    const runDir = join(cwd, '.xdou', 'runs', runId);
+    const worktreePath = join(cwd, '.xdou', 'worktrees', runId);
+    const baseRef = (await execa('git', ['rev-parse', 'HEAD'], { cwd })).stdout.trim();
+    await execa('git', ['worktree', 'add', '--detach', worktreePath, baseRef], { cwd });
+    writeFileSync(join(worktreePath, 'app.txt'), 'base\nstale apply\n');
+    const diff = await execa('git', ['diff', 'HEAD', '--', '.'], { cwd: worktreePath });
+    mkdirSync(runDir, { recursive: true });
+    writeFileSync(join(runDir, 'diff.patch'), diff.stdout);
+    writeFileSync(join(runDir, 'manifest.json'), JSON.stringify({
+      id: runId,
+      mission: 'apply stale worktree patch',
+      createdAt: '2026-01-04T03:04:05.000Z',
+      updatedAt: '2026-01-04T03:04:06.000Z',
+      status: 'completed',
+      phase: 'done',
+      artifactDir: runDir,
+      events: 3,
+      worktreePath,
+      baseRef,
+    }, null, 2));
+    writeFileSync(join(cwd, 'unrelated.txt'), 'advance main\n');
+    await execa('git', ['add', 'unrelated.txt'], { cwd });
+    await execa('git', ['commit', '-m', 'advance main'], { cwd });
+
+    const result = await runCli(['apply', runId, '--cwd', cwd], repoRoot, false);
+
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain(`Run ${runId} was based on ${baseRef}`);
+    expect(result.stderr).toContain('current HEAD is');
+    expect(readFileSync(join(cwd, 'app.txt'), 'utf8').replace(/\r\n/g, '\n')).toBe('base\n');
   });
 
   it('apply --json emits an agent-readable result envelope', async () => {
@@ -76,5 +112,44 @@ describe('apply command and machine-readable output', () => {
     const result = await runCli(['status', runId, '--json', '--cwd', cwd]);
     const payload = JSON.parse(result.stdout) as { id: string; status: string; artifactDir: string };
     expect(payload).toEqual(expect.objectContaining({ id: runId, status: 'completed', artifactDir: runDir }));
+  });
+
+  it('refuses to undo an applied run while the operator checkout is dirty', async () => {
+    const cwd = await initGitRepo();
+    writeFileSync(join(cwd, 'app.txt'), 'base\napplied\n');
+    await execa('git', ['add', 'app.txt'], { cwd });
+    await execa('git', ['commit', '-m', 'applied state'], { cwd });
+    const runId = '20260105030405-cafebabe';
+    const runDir = join(cwd, '.xdou', 'runs', runId);
+    mkdirSync(runDir, { recursive: true });
+    writeFileSync(join(runDir, 'diff.patch'), [
+      'diff --git a/app.txt b/app.txt',
+      'index df967b9..35301e4 100644',
+      '--- a/app.txt',
+      '+++ b/app.txt',
+      '@@ -1 +1,2 @@',
+      ' base',
+      '+applied',
+      '',
+    ].join('\n'));
+    writeFileSync(join(runDir, 'manifest.json'), JSON.stringify({
+      id: runId,
+      mission: 'undo dirty safety',
+      createdAt: '2026-01-05T03:04:05.000Z',
+      updatedAt: '2026-01-05T03:04:06.000Z',
+      status: 'completed',
+      phase: 'done',
+      artifactDir: runDir,
+      events: 3,
+      appliedAt: '2026-01-05T03:05:00.000Z',
+    }, null, 2));
+    writeFileSync(join(cwd, 'dirty.txt'), 'operator work\n');
+
+    const result = await runCli(['undo', runId, '--json', '--cwd', cwd], repoRoot, false);
+
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain('"ok": false');
+    expect(result.stderr).toContain('dirty working tree');
+    expect(readFileSync(join(cwd, 'app.txt'), 'utf8').replace(/\r\n/g, '\n')).toBe('base\napplied\n');
   });
 });

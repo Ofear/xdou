@@ -28,4 +28,12 @@ describe('ArtifactStore', () => {
     const run = await store.createRun('Safe');
     await expect(store.writeText(run.id, '../escape.txt', 'bad')).rejects.toThrow(/escapes run directory/);
   });
+
+  it('rejects invalid run ids before resolving read paths', async () => {
+    const root = temporaryDirectory();
+    const store = new ArtifactStore(root);
+
+    expect(() => store.runDir('../../escape')).toThrow(/Invalid run id/);
+    await expect(store.readManifest('../../escape')).rejects.toThrow(/Invalid run id/);
+  });
 });
