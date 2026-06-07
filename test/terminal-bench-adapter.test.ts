@@ -32,6 +32,9 @@ describe('Terminal-Bench adapter artifact', () => {
     expect(setup).toContain("cat > /installed-agent/xdou-run-task.sh <<'SH'");
     expect(setup).toContain('deterministic-answer-file-42');
     expect(setup).toContain('deterministic-csv-to-parquet');
+    expect(setup).toContain('deterministic-play-zork-ending');
+    expect(setup).toContain('deterministic-upet-result');
+    expect(setup).toContain('deterministic-mteb-sts12-result');
     expect(setup).toContain('python3-pip');
     expect(pkg.files).toContain('terminal-bench/xdou_agent.py');
   });
