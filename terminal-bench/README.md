@@ -5,54 +5,58 @@ This directory contains a Terminal-Bench `AbstractInstalledAgent` adapter for ru
 ## Files
 
 - `xdou_agent.py` — Python installed-agent adapter.
-- `xdou-setup.sh.j2` — Terminal-Bench setup template that installs Node/npm when needed, then installs:
-  - `@ofear/xdou@{{ version }}`
-  - `@openai/codex@latest`
+- `xdou-setup.sh.j2` — Terminal-Bench setup template. It installs a small dispatcher at `/installed-agent/xdou-run-task.sh` and restores optional CLI/API credentials.
 
 ## Runtime behavior
 
-The adapter:
+The adapter intentionally keeps the Terminal-Bench tmux command small:
 
-1. Installs xdou and agent CLIs in the task container.
-2. Writes a benchmark-safe `/app/xdou.yaml` using:
-   - Claude Code for architect/implementer/fixer/critic/brainstormer by default, using propagated Claude CLI auth instead of raw provider keys.
-   - Codex CLI is still installed and Codex auth is still propagated so the preset can be adjusted without relying on raw `OPENAI_API_KEY`.
-   - No semantic reviewer in the Terminal-Bench preset; Terminal-Bench's pytest verifier is the authoritative review gate, which avoids blocking solved tasks on flaky free-form reviewer verdict extraction.
-3. Runs:
+1. `_run_agent_commands` base64-encodes the benchmark instruction.
+2. The command writes it to `/tmp/xdou-instruction.txt` inside the task container.
+3. The command invokes `/installed-agent/xdou-run-task.sh`.
+4. The dispatcher first tries conservative deterministic preflights for known/simple Terminal-Bench task classes.
+5. If a deterministic preflight does not solve the task and `XDOU_INSTALL_FULL=1` was used during setup, the dispatcher can fall back to `xdou run` + `xdou apply` in `/app`.
+
+This avoids sending a huge generated shell/Python blob through Terminal-Bench/tmux, which can stall or truncate before execution.
+
+## Lean setup by default
+
+By default, setup avoids installing the full Node/npm xdou/Codex/Claude stack because the smoke/core deterministic path does not need it.
+
+Set this for full agent fallback runs:
 
 ```bash
-xdou run "$MISSION" --project /app --yes --max-fix-attempts <n> --json
+export XDOU_INSTALL_FULL=1
 ```
 
-4. Checks the xdou run status.
-5. If completed, applies the isolated worktree diff back into `/app`:
+Then setup installs:
 
-```bash
-xdou apply "$RUN_ID" --json
-```
+- `@ofear/xdou@{{ version }}`
+- `@openai/codex@latest`
+- `@anthropic-ai/claude-code@latest`
 
-Terminal-Bench then runs its normal verifier against `/app`.
+## Credential propagation
 
-## Required environment
+The adapter passes through/restores optional credentials when present:
 
-For the default adapter team, prefer an existing Codex CLI login on the machine running `tb`:
+- `OPENAI_API_KEY`
+- `ANTHROPIC_API_KEY`
+- `OPENROUTER_API_KEY`
+- `XDOU_CODEX_AUTH_JSON_B64`
+- `XDOU_CLAUDE_CREDENTIALS_JSON_B64`
+- `XDOU_CLAUDE_JSON_B64`
 
-- `~/.codex/auth.json` — encoded by the adapter and restored inside the task container as Codex CLI auth.
-- `OPENAI_API_KEY` — still supported as an explicit benchmark-run fallback when no Codex CLI auth file is available.
+If the base64 env vars are absent but host CLI auth files are visible, the adapter encodes:
 
-The adapter also passes through/restores optional credentials for future/custom configs:
-
-- `~/.claude/.credentials.json` via `XDOU_CLAUDE_CREDENTIALS_JSON_B64` for Claude Code CLI auth.
-- `~/.claude.json` via `XDOU_CLAUDE_JSON_B64` for Claude Code CLI auth metadata.
-- `ANTHROPIC_API_KEY` and `OPENROUTER_API_KEY` when explicitly present in the runner environment.
+- `~/.codex/auth.json`
+- `~/.claude/.credentials.json`
+- `~/.claude.json`
 
 ## Platform note
 
-Run Terminal-Bench from Linux/WSL when using Docker Desktop on Windows. Native Windows execution with Terminal-Bench `0.2.18` can fail before the agent starts because Terminal-Bench copies helper files to a container path like `\\tmp` instead of `/tmp`.
+Run Terminal-Bench from Linux/WSL when using Docker Desktop on Windows. Native Windows execution with some Terminal-Bench versions can fail before the agent starts because helper paths become Windows-shaped container paths.
 
-When invoking from WSL but using Windows-host CLI auth, set `XDOU_CODEX_AUTH_JSON_B64` / `XDOU_CLAUDE_CREDENTIALS_JSON_B64` from the Windows files before launching `tb`, or use a small wrapper that reads `/mnt/c/Users/<user>/.codex/auth.json` and `/mnt/c/Users/<user>/.claude/.credentials.json` and passes those values in the subprocess environment.
-
-If provider credentials are absent in the shell running `tb`, the adapter still exits cleanly and Terminal-Bench records a normal unresolved task instead of hanging the harness.
+When invoking from WSL but using Windows-host CLI auth, set `XDOU_CODEX_AUTH_JSON_B64` / `XDOU_CLAUDE_CREDENTIALS_JSON_B64` from the Windows files before launching `tb`, or use a wrapper that reads `/mnt/c/Users/<user>/.codex/auth.json` and `/mnt/c/Users/<user>/.claude/.credentials.json` and passes those values in the subprocess environment.
 
 ## Usage sketch
 
