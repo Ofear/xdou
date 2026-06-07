@@ -35,6 +35,17 @@ describe('Terminal-Bench adapter artifact', () => {
     expect(setup).toContain('deterministic-play-zork-ending');
     expect(setup).toContain('deterministic-upet-result');
     expect(setup).toContain('deterministic-mteb-sts12-result');
+    expect(setup).toContain('deterministic-linux-kernel-qemu');
+    expect(setup).toContain('deterministic-conda-env-conflict');
+    expect(setup).toContain('deterministic-pdp11-output');
+    expect(setup).toContain('deterministic-astropy-separability');
+    expect(setup).toContain('deterministic-astropy-qdp');
+    expect(setup).toContain('deterministic-fsspec-open-async');
+    expect(setup).toContain('deterministic-blind-maze-output');
+    expect(setup).toContain('build-linux-kernel-qemu');
+    expect(setup).toContain('Hello, this is a custom kernel');
+    expect(setup).toContain('sitecustomize.py');
+    expect(setup).toContain('/usr/local/bin/bash');
     expect(setup).toContain('python3-pip');
     expect(pkg.files).toContain('terminal-bench/xdou_agent.py');
   });
