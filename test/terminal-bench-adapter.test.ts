@@ -15,6 +15,7 @@ describe('Terminal-Bench adapter artifact', () => {
     expect(adapter).toContain('"XDOU_CODEX_AUTH_JSON_B64"');
     expect(adapter).toContain('"XDOU_CLAUDE_CREDENTIALS_JSON_B64"');
     expect(adapter).toContain('"XDOU_CLAUDE_JSON_B64"');
+    expect(adapter).toContain('"XDOU_INSTALL_FULL"');
     expect(adapter).toContain('/tmp/xdou-instruction.txt');
     expect(adapter).toContain('/installed-agent/xdou-run-task.sh');
     expect(adapter).not.toContain('xdou run');

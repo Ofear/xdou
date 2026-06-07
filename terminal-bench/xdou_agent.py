@@ -36,6 +36,7 @@ class XdouAgent(AbstractInstalledAgent):
                 "XDOU_CODEX_AUTH_JSON_B64",
                 "XDOU_CLAUDE_CREDENTIALS_JSON_B64",
                 "XDOU_CLAUDE_JSON_B64",
+                "XDOU_INSTALL_FULL",
             ]
             if os.environ.get(key)
         }
