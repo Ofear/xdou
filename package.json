@@ -1,6 +1,6 @@
 {
   "name": "@ofear/xdou",
-  "version": "1.2.20",
+  "version": "1.2.21",
   "description": "A terminal-native multi-agent development system where selected coding and architecture agents co-develop through council, synthesis, implementation, review, and validation loops.",
   "main": "dist/cli.js",
   "scripts": {

@@ -1,4 +1,5 @@
 import type { AgentAdapter, AgentRole, AgentType } from '../types.js';
+export type { AgentAdapter } from '../types.js';
 import { ClaudeCodeAdapter } from './claude-code.js';
 import { CodexAdapter } from './codex.js';
 import { OpenCodeAdapter } from './opencode.js';

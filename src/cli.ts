@@ -8,12 +8,17 @@ import { isAbsolute, join, resolve } from 'node:path';
 import { createInterface } from 'node:readline/promises';
 import { execa } from 'execa';
 import { XdouOrchestrator } from './orchestrator.js';
-import { defaultConfig, type TeamConfig } from './config/schema.js';
+import { defaultConfig, type TeamConfig, type XdouConfig } from './config/schema.js';
 import { loadConfig } from './config/load.js';
 import { isActionableCodingMission, launchCockpit, readCockpitState, renderCockpitSnapshot, type CockpitOperatorCommand } from './tui/cockpit.js';
 import { shouldAnswerAskLocally } from './core/ask-routing.js';
 import { isGitRepo, hasGitHead } from './core/repo.js';
 import { selectAgents } from './agents/registry.js';
+import { runLoopCommand, type LoopCommandContext } from './commands/loop.js';
+import { runGoalCommand } from './commands/goal.js';
+import { runLoopsCommand } from './commands/loops.js';
+import { runPluginsCommand, type PluginCommandContext } from './commands/plugins.js';
+import type { DaemonInvocation } from './core/loop-engine.js';
 
 interface ProjectResolutionOptions { project?: string | undefined; yes?: boolean; noInit?: boolean; dryRun?: boolean }
 
@@ -60,6 +65,10 @@ class Xdou extends Command {
       case 'context': await this.context(orchestrator, rest); break;
       case 'collab': await this.collab(orchestrator, rest, flags.json); break;
       case 'cockpit': await this.cockpit(orchestrator, rest, flags.snapshot, team, flags.agents, flags['max-fix-attempts'], flags.json); break;
+      case 'loop': await runLoopCommand(this.loopContext(cwd, config, rest, flags.json, flags.agents)); break;
+      case 'goal': await runGoalCommand(this.loopContext(cwd, config, rest, flags.json, flags.agents)); break;
+      case 'loops': await runLoopsCommand(this.loopContext(cwd, config, rest, flags.json, flags.agents)); break;
+      case 'plugins': await runPluginsCommand(this.pluginContext(cwd, rest, flags.json)); break;
       case 'config': await this.configCommand(cwd, rest); break;
       case undefined:
       case 'help':
@@ -67,12 +76,12 @@ class Xdou extends Command {
       case '-h':
         this.log(this.helpText());
         break;
-      default: throw new Error(`Unknown command: ${cmd}. Try: xdou init | agents detect | brainstorm | plan | run | status | runs list | context | config validate`);
+      default: throw new Error(`Unknown command: ${cmd}. Try: xdou init | agents detect | brainstorm | plan | run | loop | goal | loops list | plugins init|load|list|call|unload | status | runs list | context | config validate`);
     }
   }
 
   private helpText(): string {
-    return 'xdou: multi-agent coding from your terminal\n\nCommands:\n  init\n  agents [list|detect]\n  ask <question>\n  find <file-query>\n  brainstorm <mission> [--agents a,b]\n  plan <mission>\n  run <mission> [--agents architect,implementer,reviewer] [--max-fix-attempts n] [--project path] [--yes] [--json]\n  apply [run-id] [--json]\n  test [run-id] [--json]\n  discard [run-id] [--json]\n  undo [run-id] [--json]\n  cockpit [run-id] [--snapshot]\n  status [run-id]\n  runs list\n  context [run-id]\n  config validate';
+    return 'xdou: multi-agent coding from your terminal\\n\\nCommands:\\n  init\\n  agents [list|detect]\\n  ask <question>\\n  find <file-query>\\n  brainstorm <mission> [--agents a,b]\\n  plan <mission>\\n  run <mission> [--agents architect,implementer,reviewer] [--max-fix-attempts n] [--project path] [--yes] [--json]\\n  apply [run-id] [--json]\\n  test [run-id] [--json]\\n  discard [run-id] [--json]\\n  undo [run-id] [--json]\\n  cockpit [run-id] [--snapshot]\\n  loop <cadence> <prompt>     Run a prompt on a schedule (hourly|daily|30m|"*/30 * * * *")\\n  goal <condition>            Run until a verifiable condition is satisfied\\n  loops list                  List loops with status\\n  loops pause|resume|stop <id>  Control a loop\\n  loops logs <id> [--tail n]  View loop execution logs\\n  plugins init|load|list|call|unload  Manage MCP plugins\\n  status [run-id]\\n  runs list\\n  context [run-id]\\n  config validate';
   }
 
   private async initProject(cwd: string): Promise<void> {
@@ -87,7 +96,7 @@ class Xdou extends Command {
   private async ensureGitignore(cwd: string): Promise<void> {
     const path = join(cwd, '.gitignore');
     const current = await fs.readFile(path, 'utf8').catch(() => '');
-    const required = ['.xdou/runs/', '.xdou/worktrees/'];
+    const required = ['.xdou/runs/', '.xdou/worktrees/', '.xdou/loops/'];
     const existing = current.split(/\r?\n/);
     const missing = required.filter((line) => !existing.includes(line));
     if (missing.length) await fs.appendFile(path, `${current && !current.endsWith('\n') ? '\n' : ''}${missing.join('\n')}\n`, 'utf8');
@@ -433,6 +442,24 @@ class Xdou extends Command {
     if ((args[0] ?? 'validate') !== 'validate') throw new Error('Usage: xdou config validate');
     const loaded = await loadConfig(cwd);
     this.log(`${pc.green('valid')} ${loaded.filepath ?? 'defaults'}`);
+  }
+
+  private loopContext(cwd: string, config: XdouConfig, args: string[], json: boolean, agentsFlag?: string): LoopCommandContext {
+    return { cwd, config, args, json, agentsFlag, daemonInvocation: this.daemonInvocation(), log: (message: string) => { this.log(message); } };
+  }
+
+  private pluginContext(cwd: string, args: string[], json: boolean): PluginCommandContext {
+    return { cwd, args, json, log: (message: string) => { this.log(message); } };
+  }
+
+  private daemonInvocation(): DaemonInvocation {
+    // Replay the exact runtime that launched this process: node-level flags (process.execArgv,
+    // which carries any TypeScript loader such as tsx's `--import`) followed by the entry script.
+    // This reproduces the dev (tsx) and published (plain node dist/cli.js) launches alike, so the
+    // detached daemon resolves its imports the same way the foreground process did.
+    const script = process.argv[1];
+    const argv = [...process.execArgv, ...(script ? [script] : [])];
+    return { execPath: process.execPath, argv };
   }
 }
 

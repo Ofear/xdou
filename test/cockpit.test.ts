@@ -67,6 +67,7 @@ describe('cockpit command', () => {
     expect(result.stdout).toContain('Changed: 1 file(s)');
     expect(result.stdout).toContain('Tests: failed');
     expect(result.stdout).toContain('Review: claude request_changes');
+    expect(result.stdout).toContain('[v] diff [r] review [t] test [f] fix');
   });
 
   it('renders an empty cockpit as an operator cockpit v2, not a plain launcher', async () => {
@@ -81,7 +82,8 @@ describe('cockpit command', () => {
     expect(result.stdout).toContain('┌ Operator Attention ');
     expect(result.stdout).toContain('┌ Prompt Composer ');
     expect(result.stdout).toContain('No action needed. Type a mission or command below.');
-    expect(result.stdout).toContain('Prompt: /ask question | /find file | /web topic | /plan <idea> | /code <idea>');
+    expect(result.stdout).toContain('[1] new mission idle');
+    expect(result.stdout).toContain('[2] parallel task empty');
     expect(result.stdout).toContain('/ask /find /web do not require Git. /code and /run will initialize Git in a project folder.');
   });
 
@@ -130,7 +132,6 @@ describe('cockpit command', () => {
 
   it('shows typed prompt text in the visible composer instead of hiding it in an overlay', () => {
     const output = renderCockpitSnapshot({ runs: [], selected: undefined, timeline: [], verdicts: [], artifacts: { plan: [], diff: [], review: [], summary: [] } }, 120, 'plan test cockpit prompt');
-    expect(output).toContain('┌ Prompt Composer ');
     expect(output).toContain('Prompt: plan test cockpit prompt█');
     expect(output).toContain('/ask /find /web do not require Git. /code and /run will initialize Git in a project folder.');
   });
