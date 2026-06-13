@@ -81,8 +81,8 @@ class Xdou extends Command {
   }
 
   private helpText(): string {
-    return 'xdou: multi-agent coding from your terminal\\n\\nCommands:\\n  init\\n  agents [list|detect]\\n  ask <question>\\n  find <file-query>\\n  brainstorm <mission> [--agents a,b]\\n  plan <mission>\\n  run <mission> [--agents architect,implementer,reviewer] [--max-fix-attempts n] [--project path] [--yes] [--json]\\n  apply [run-id] [--json]\\n  test [run-id] [--json]\\n  discard [run-id] [--json]\\n  undo [run-id] [--json]\\n  cockpit [run-id] [--snapshot]\\n  loop <cadence> <prompt>     Run a prompt on a schedule (hourly|daily|30m|"*/30 * * * *")\\n  goal <condition>            Run until a verifiable condition is satisfied\\n  loops list                  List loops with status\\n  loops pause|resume|stop <id>  Control a loop\\n  loops logs <id> [--tail n]  View loop execution logs\\n  plugins init|load|list|call|unload  Manage MCP plugins\\n  status [run-id]\\n  runs list\\n  context [run-id]\\n  config validate';
-  }
+      return 'xdou: multi-agent coding from your terminal\n\nCommands:\n  init\n  agents [list|detect]\n  ask <question>\n  find <file-query>\n  brainstorm <mission> [--agents a,b]\n  plan <mission>\n  run <mission> [--agents architect,implementer,reviewer] [--max-fix-attempts n] [--project path] [--yes] [--json]\n  apply [run-id] [--json]\n  test [run-id] [--json]\n  discard [run-id] [--json]\n  undo [run-id] [--json]\n  cockpit [run-id] [--snapshot]\n  loop <cadence> <prompt>     Run a prompt on a schedule (hourly|daily|30m|"*/30 * * * *")\n  goal <condition>            Run until a verifiable condition is satisfied\n  loops list                  List loops with status\n  loops pause|resume|stop <id>  Control a loop\n  loops logs <id> [--tail n]  View loop execution logs\n  plugins init|load|list|call|unload  Manage MCP plugins\n  status [run-id]\n  runs list\n  context [run-id]\n  config validate';
+    }
 
   private async initProject(cwd: string): Promise<void> {
     const configPath = join(cwd, 'xdou.yaml');
