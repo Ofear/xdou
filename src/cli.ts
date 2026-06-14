@@ -361,6 +361,9 @@ class Xdou extends Command {
       },
     };
 
+    // Create the session on disk up front so the id we print always resolves on resume,
+    // even if the operator quits before sending a message.
+    persist({ entries: history, summary: startSummary, summarizedCount: startSummarizedCount });
     await launchCockpit(state, controller, { sessionId, history, summary: startSummary, summarizedCount: startSummarizedCount, onPersist: persist, roster: teamRoster(team) });
     await persistChain;
     this.log(`${pc.dim('session saved')} ${sessionId}\n${pc.dim('resume with:')} xdou cockpit --session ${sessionId}`);
