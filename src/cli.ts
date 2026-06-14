@@ -11,7 +11,7 @@ import { XdouOrchestrator } from './orchestrator.js';
 import { defaultConfig, type TeamConfig, type XdouConfig } from './config/schema.js';
 import { loadConfig } from './config/load.js';
 import { isActionableCodingMission, launchCockpit, readCockpitState, renderCockpitSnapshot, type CockpitController, type CockpitOperatorCommand, type ConversationEntry } from './tui/cockpit.js';
-import { listSessions, newSessionId, readSession, writeSession } from './core/cockpit-sessions.js';
+import { deleteSession, isEmptySession, listSessions, newSessionId, pruneEmptySessions, readSession, writeSession } from './core/cockpit-sessions.js';
 import { filterTeam, teamRoster } from './core/cockpit-team.js';
 import { buildAssistantPrompt, buildSummaryPrompt, buildWebSearchPrompt, parseWebProvenance } from './core/assistant-prompt.js';
 import { shouldAnswerAskLocally } from './core/ask-routing.js';
@@ -87,7 +87,7 @@ class Xdou extends Command {
   }
 
   private helpText(): string {
-      return 'xdou: multi-agent coding from your terminal\n\nCommands:\n  init\n  agents [list|detect]\n  ask <question>\n  web <topic>                 Live web research (cites real sources, labels provenance)\n  find <file-query>\n  brainstorm <mission> [--agents a,b]\n  plan <mission>\n  run <mission> [--agents architect,implementer,reviewer] [--max-fix-attempts n] [--project path] [--yes] [--json]\n  apply [run-id] [--json]\n  test [run-id] [--json]\n  discard [run-id] [--json]\n  undo [run-id] [--json]\n  cockpit [run-id] [--snapshot] [--session id]\n  sessions list               List saved cockpit chat sessions\n  loop <cadence> <prompt>     Run a prompt on a schedule (hourly|daily|30m|"*/30 * * * *")\n  goal <condition>            Run until a verifiable condition is satisfied\n  loops list                  List loops with status\n  loops pause|resume|stop <id>  Control a loop\n  loops logs <id> [--tail n]  View loop execution logs\n  plugins init|load|list|call|unload  Manage MCP plugins\n  status [run-id]\n  runs list\n  context [run-id]\n  config validate';
+      return 'xdou: multi-agent coding from your terminal\n\nCommands:\n  init\n  agents [list|detect]\n  ask <question>\n  web <topic>                 Live web research (cites real sources, labels provenance)\n  find <file-query>\n  brainstorm <mission> [--agents a,b]\n  plan <mission>\n  run <mission> [--agents architect,implementer,reviewer] [--max-fix-attempts n] [--project path] [--yes] [--json]\n  apply [run-id] [--json]\n  test [run-id] [--json]\n  discard [run-id] [--json]\n  undo [run-id] [--json]\n  cockpit [run-id] [--snapshot] [--session id]\n  sessions [list|prune]       List saved chat sessions (prune drops empty ones)\n  loop <cadence> <prompt>     Run a prompt on a schedule (hourly|daily|30m|"*/30 * * * *")\n  goal <condition>            Run until a verifiable condition is satisfied\n  loops list                  List loops with status\n  loops pause|resume|stop <id>  Control a loop\n  loops logs <id> [--tail n]  View loop execution logs\n  plugins init|load|list|call|unload  Manage MCP plugins\n  status [run-id]\n  runs list\n  context [run-id]\n  config validate';
     }
 
   private async initProject(cwd: string): Promise<void> {
@@ -320,8 +320,10 @@ class Xdou extends Command {
     const startSummarizedCount = existing?.summarizedCount ?? 0;
     if (existing) history.push({ author: 'system', text: `Resumed session ${sessionId} (${existing.entries.length} earlier messages).` });
     let persistChain: Promise<void> = Promise.resolve();
+    let lastEntries: ConversationEntry[] = history;
     const persist = (snapshot: { entries: ConversationEntry[]; summary: string; summarizedCount: number }): void => {
       const snapshotEntries = snapshot.entries.map((entry) => ({ ...entry }));
+      lastEntries = snapshotEntries;
       persistChain = persistChain.then(() => writeSession(orchestrator.store, { id: sessionId, createdAt, updatedAt: new Date().toISOString(), entries: snapshotEntries, summary: snapshot.summary, summarizedCount: snapshot.summarizedCount })).catch(() => { /* best-effort */ });
     };
 
@@ -366,6 +368,12 @@ class Xdou extends Command {
     persist({ entries: history, summary: startSummary, summarizedCount: startSummarizedCount });
     await launchCockpit(state, controller, { sessionId, history, summary: startSummary, summarizedCount: startSummarizedCount, onPersist: persist, roster: teamRoster(team) });
     await persistChain;
+    // A session that never got a real message (quit before chatting) is noise — drop it and say
+    // nothing about resuming. Only advertise the resume id when there's an actual conversation to resume.
+    if (isEmptySession({ id: sessionId, createdAt, updatedAt: createdAt, entries: lastEntries })) {
+      await deleteSession(orchestrator.store, sessionId).catch(() => { /* best-effort */ });
+      return;
+    }
     this.log(`${pc.dim('session saved')} ${sessionId}\n${pc.dim('resume with:')} xdou cockpit --session ${sessionId}`);
   }
 
@@ -411,7 +419,13 @@ class Xdou extends Command {
 
   private async sessions(orchestrator: XdouOrchestrator, args: string[], json: boolean): Promise<void> {
     const sub = args[0] ?? 'list';
-    if (sub !== 'list') throw new Error('Usage: xdou sessions list');
+    if (sub === 'prune') {
+      const removed = await pruneEmptySessions(orchestrator.store);
+      if (json) { this.log(JSON.stringify({ removed }, null, 2)); return; }
+      this.log(removed ? `Pruned ${removed} empty session(s).` : 'No empty sessions to prune.');
+      return;
+    }
+    if (sub !== 'list') throw new Error('Usage: xdou sessions [list|prune]');
     const all = await listSessions(orchestrator.store);
     if (json) { this.log(JSON.stringify(all, null, 2)); return; }
     if (!all.length) { this.log('No sessions found.'); return; }

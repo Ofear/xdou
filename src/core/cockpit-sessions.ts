@@ -39,6 +39,17 @@ export async function readSession(store: ArtifactStore, id: string): Promise<Coc
   }
 }
 
+// A session is "empty" until the operator has exchanged at least one real message. `system` entries
+// (launch/resume banners, status notes) are housekeeping and don't count as a conversation. Empty
+// sessions are hidden from listings and pruned on exit so quick open-and-quit launches don't pile up.
+export function isEmptySession(session: CockpitSession): boolean {
+  return !session.entries.some((entry) => entry.author !== 'system');
+}
+
+export async function deleteSession(store: ArtifactStore, id: string): Promise<void> {
+  await fs.remove(sessionPath(store, id));
+}
+
 export async function writeSession(store: ArtifactStore, session: CockpitSession): Promise<void> {
   await fs.ensureDir(sessionsDir(store));
   // Write to a temp file then rename so a kill mid-write can't leave a half-written (corrupt) session.
@@ -48,7 +59,9 @@ export async function writeSession(store: ArtifactStore, session: CockpitSession
   await fs.move(tmp, path, { overwrite: true });
 }
 
-export async function listSessions(store: ArtifactStore): Promise<CockpitSession[]> {
+// All readable sessions, newest first — including empty ones (used by prune). Most callers want
+// listSessions(), which hides empties.
+export async function readAllSessions(store: ArtifactStore): Promise<CockpitSession[]> {
   const dir = sessionsDir(store);
   if (!(await fs.pathExists(dir))) return [];
   const files = (await fs.readdir(dir)).filter((file) => file.endsWith('.json'));
@@ -57,4 +70,15 @@ export async function listSessions(store: ArtifactStore): Promise<CockpitSession
     try { sessions.push(await fs.readJson(join(dir, file)) as CockpitSession); } catch { /* skip unreadable session */ }
   }
   return sessions.sort((a, b) => (a.updatedAt < b.updatedAt ? 1 : -1));
+}
+
+export async function listSessions(store: ArtifactStore): Promise<CockpitSession[]> {
+  return (await readAllSessions(store)).filter((session) => !isEmptySession(session));
+}
+
+// Remove every empty (no real conversation) session file. Returns the count removed.
+export async function pruneEmptySessions(store: ArtifactStore): Promise<number> {
+  const empties = (await readAllSessions(store)).filter(isEmptySession);
+  for (const session of empties) await deleteSession(store, session.id);
+  return empties.length;
 }

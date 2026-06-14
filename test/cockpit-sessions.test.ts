@@ -3,7 +3,7 @@ import { temporaryDirectory } from 'tempy';
 import fsExtra from 'fs-extra';
 import { join } from 'node:path';
 import { ArtifactStore } from '../src/core/artifact-store.js';
-import { listSessions, newSessionId, readSession, writeSession } from '../src/core/cockpit-sessions.js';
+import { isEmptySession, listSessions, newSessionId, pruneEmptySessions, readAllSessions, readSession, writeSession } from '../src/core/cockpit-sessions.js';
 import { filterTeam, teamRoster } from '../src/core/cockpit-team.js';
 import { buildAssistantPrompt, buildSummaryPrompt, buildWebSearchPrompt, capHistory, parseWebProvenance, type AssistantTurn } from '../src/core/assistant-prompt.js';
 import type { TeamConfig } from '../src/config/schema.js';
@@ -37,6 +37,31 @@ describe('cockpit sessions', () => {
     // simulate a half-written / corrupt file
     await fsExtra.writeFile(join(store.root, 'sessions', `${id}.json`), '{ "id": "trunc', 'utf8');
     expect(await readSession(store, id)).toBeUndefined();
+  });
+
+  it('treats sessions with no real messages as empty (system-only or none)', () => {
+    const base = { createdAt: '', updatedAt: '' };
+    expect(isEmptySession({ id: newSessionId(), ...base, entries: [] })).toBe(true);
+    expect(isEmptySession({ id: newSessionId(), ...base, entries: [{ author: 'system', text: 'Resumed session (0 earlier messages).' }] })).toBe(true);
+    expect(isEmptySession({ id: newSessionId(), ...base, entries: [{ author: 'system', text: 'note' }, { author: 'you', text: 'hi', mine: true }] })).toBe(false);
+  });
+
+  it('hides empty sessions from listings but keeps them readable, and prunes them', async () => {
+    const store = new ArtifactStore(temporaryDirectory());
+    const now = new Date().toISOString();
+    const real = newSessionId();
+    const empty = newSessionId();
+    await writeSession(store, { id: real, createdAt: now, updatedAt: now, entries: [{ author: 'you', text: 'hi', mine: true }] });
+    await writeSession(store, { id: empty, createdAt: now, updatedAt: now, entries: [{ author: 'system', text: 'launched' }] });
+
+    const listed = await listSessions(store);
+    expect(listed.map((s) => s.id)).toEqual([real]);          // empty hidden from list
+    expect((await readAllSessions(store)).map((s) => s.id)).toEqual(expect.arrayContaining([real, empty])); // still on disk
+
+    const removed = await pruneEmptySessions(store);
+    expect(removed).toBe(1);
+    expect(await readSession(store, empty)).toBeUndefined();   // empty gone
+    expect(await readSession(store, real)).toBeDefined();      // real kept
   });
 });
 
