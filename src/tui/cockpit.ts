@@ -6,18 +6,70 @@ import type { ArtifactStore } from '../core/artifact-store.js';
 import { readCollaborationState, type CollaborationEvent, type CollaborationState } from '../core/live-collaboration.js';
 import type { RunManifest } from '../types.js';
 
-interface TimelineEvent { time: string | undefined; type: string | undefined; by: string | undefined; verdict: string | undefined; status: string | undefined; phase: string | undefined; ok: boolean | undefined }
-interface ReviewVerdictSummary { agent: string; verdict: string; reason: string; confidence: number | undefined; missingRequirements: string[] }
-interface ArtifactPreview { plan: string[]; diff: string[]; review: string[]; summary: string[] }
-interface AgentCard { id: string; role: string; status: string; last: string }
-export interface CockpitState { runs: RunManifest[]; selected: RunManifest | undefined; timeline: TimelineEvent[]; verdicts: ReviewVerdictSummary[]; artifacts: ArtifactPreview; collaboration?: CollaborationState }
-export interface CockpitMissionCommand { action: 'plan' | 'run'; mission: string }
-export type CockpitOperatorCommand = CockpitMissionCommand | { action: 'ask'; prompt: string } | { action: 'web'; query: string } | { action: 'find'; query: string } | { action: 'continue' } | { action: 'parallel'; mission: string } | { action: 'diff' | 'review' | 'status' | 'apply' | 'test' | 'fix' | 'discard' | 'undo'; runId?: string };
-export type CockpitLaunchResult = { kind: 'exit' } | { kind: 'mission'; command: 'plan' | 'run'; mission: string } | { kind: 'operator'; command: CockpitOperatorCommand };
+interface TimelineEvent {
+  time: string | undefined;
+  type: string | undefined;
+  by: string | undefined;
+  verdict: string | undefined;
+  status: string | undefined;
+  phase: string | undefined;
+  ok: boolean | undefined;
+}
+
+interface ReviewVerdictSummary {
+  agent: string;
+  verdict: string;
+  reason: string;
+  confidence: number | undefined;
+  missingRequirements: string[];
+}
+
+interface ArtifactPreview {
+  plan: string[];
+  diff: string[];
+  review: string[];
+  summary: string[];
+}
+
+interface AgentCard {
+  id: string;
+  role: string;
+  status: string;
+  last: string;
+}
+
+export interface CockpitState {
+  runs: RunManifest[];
+  selected: RunManifest | undefined;
+  timeline: TimelineEvent[];
+  verdicts: ReviewVerdictSummary[];
+  artifacts: ArtifactPreview;
+  collaboration?: CollaborationState;
+}
+
+export interface CockpitMissionCommand {
+  action: 'plan' | 'run';
+  mission: string;
+}
+
+export type CockpitOperatorCommand =
+  | CockpitMissionCommand
+  | { action: 'ask'; prompt: string }
+  | { action: 'web'; query: string }
+  | { action: 'find'; query: string }
+  | { action: 'continue' }
+  | { action: 'parallel'; mission: string }
+  | { action: 'diff' | 'review' | 'status' | 'apply' | 'test' | 'fix' | 'discard' | 'undo'; runId?: string };
+
+export type CockpitLaunchResult =
+  | { kind: 'exit' }
+  | { kind: 'mission'; command: 'plan' | 'run'; mission: string }
+  | { kind: 'operator'; command: CockpitOperatorCommand };
 
 const missionActionVerbs = new Set([
   'add', 'build', 'create', 'make', 'implement', 'fix', 'debug', 'refactor', 'update', 'change', 'improve', 'write', 'generate', 'design', 'plan', 'run', 'code', 'test',
 ]);
+
 const conversationalOpeners = new Set(['hi', 'hello', 'hey', 'yo', 'thanks', 'thank', 'ok', 'okay', 'sup']);
 const nonCodingOpeners = new Set(['what', 'how', 'why', 'who', 'when', 'where', 'tell', 'explain', 'summarize', 'describe', 'read', 'show']);
 
@@ -82,9 +134,6 @@ export function parseCockpitInputChunk(data: string): string {
   const bracketed = data.match(/^\x1b\[200~([\s\S]*)\x1b\[201~$/);
   return bracketed ? bracketed[1] ?? '' : data;
 }
-
-const actionBar = '[tab] pane  [enter] send  /ask /find /web /plan /code /test /fix /apply /undo  [v] diff [r] review [t] test [f] fix [a] apply [q] quit';
-function actionBarLine(width: number): string { return dim(truncate(actionBar, Math.max(20, width))); }
 
 const reset = '\x1b[0m';
 const sgr = (code: number, value: string): string => `\x1b[${code}m${value}${reset}`;
@@ -178,12 +227,52 @@ export async function readCockpitState(store: ArtifactStore, runId?: string): Pr
   return collaboration ? { runs, selected, timeline, verdicts, artifacts, collaboration } : { runs, selected, timeline, verdicts, artifacts };
 }
 
-function fmtEvent(event: TimelineEvent): string {
+// ─── Human-readable event translation ───
+
+const HUMAN_EVENTS: Record<string, { label: string; icon: string; color: (s: string) => string }> = {
+  'run.created': { label: 'Run started', icon: '🚀', color: cyan },
+  'council.finished': { label: 'Agent council complete', icon: '✅', color: green },
+  'council.started': { label: 'Agent council started', icon: '🤝', color: cyan },
+  'plan.created': { label: 'Plan created', icon: '📋', color: cyan },
+  'implementation.finished': { label: 'Implementation done', icon: '💻', color: green },
+  'implementation.started': { label: 'Implementation started', icon: '💻', color: yellow },
+  'validation.finished': { label: 'Tests passed', icon: '✅', color: green },
+  'validation.started': { label: 'Running tests', icon: '🧪', color: yellow },
+  'validation.failed': { label: 'Tests failed', icon: '❌', color: red },
+  'review.finished': { label: 'Review complete', icon: '👁', color: magenta },
+  'review.started': { label: 'Review started', icon: '👁', color: cyan },
+  'run.aborted': { label: 'Run aborted', icon: '⛔', color: red },
+  'run.completed': { label: 'Run completed', icon: '✅', color: green },
+  'fix.started': { label: 'Fix started', icon: '🔧', color: yellow },
+  'fix.finished': { label: 'Fix complete', icon: '🔧', color: green },
+  'apply.started': { label: 'Applying changes', icon: '📥', color: cyan },
+  'apply.finished': { label: 'Changes applied', icon: '✅', color: green },
+  'discard.started': { label: 'Discarding run', icon: '🗑', color: yellow },
+  'discard.finished': { label: 'Run discarded', icon: '🗑', color: red },
+  'undo.started': { label: 'Rolling back', icon: '↩️', color: yellow },
+  'undo.finished': { label: 'Rollback complete', icon: '✅', color: green },
+};
+
+function humanEvent(event: TimelineEvent): { label: string; icon: string; color: (s: string) => string } {
+  const key = event.type ?? '';
+  const base = HUMAN_EVENTS[key] ?? { label: key || 'event', icon: '•', color: dim };
+  // Special handling for validation events based on ok status
+  if (key === 'validation.finished') {
+    if (event.ok === false) return { label: 'Tests failed', icon: '❌', color: red };
+    if (event.ok === true) return { label: 'Tests passed', icon: '✅', color: green };
+  }
+  return base;
+}
+
+function fmtEvent(event: TimelineEvent): { time: string; line: string; raw: string } {
   const time = event.time ? event.time.slice(11, 19) : '--:--:--';
-  const actor = event.by ? ` ${event.by}` : '';
+  const human = humanEvent(event);
+  const actor = event.by ? ` ${dim(event.by)}` : '';
   const verdict = event.verdict ? ` ${event.verdict}` : '';
-  const ok = event.ok === undefined ? '' : event.ok ? ' ✓' : ' ✗';
-  return `${time} ${event.type ?? 'event'}${actor}${verdict}${ok}`;
+  const ok = event.ok === undefined ? '' : event.ok ? ` ${green('✓')}` : ` ${red('✗')}`;
+  const line = `${human.icon} ${human.color(human.label)}${actor}${verdict}${ok}`;
+  const raw = `${time} ${event.type ?? 'event'}${actor}${verdict}${ok}`;
+  return { time, line, raw };
 }
 
 function truncate(value: string, width: number): string {
@@ -196,6 +285,28 @@ function pad(value: string, width: number): string {
   return clipped + ' '.repeat(Math.max(0, width - visibleWidth(clipped)));
 }
 
+// ─── Semantic status colors for agents ───
+
+function agentStatusDisplay(status: string): { icon: string; color: (s: string) => string; label: string } {
+  switch (status) {
+    case 'done':
+    case 'completed':
+      return { icon: '🟢', color: green, label: 'done' };
+    case 'working':
+    case 'active':
+    case 'running':
+      return { icon: '🟡', color: yellow, label: 'working' };
+    case 'blocked':
+    case 'failed':
+      return { icon: '🔴', color: red, label: 'blocked' };
+    case 'waiting':
+    case 'queued':
+    case 'idle':
+    default:
+      return { icon: '⚪', color: dim, label: 'waiting' };
+  }
+}
+
 function agentsFromState(state: CockpitState): AgentCard[] {
   const seen = new Map<string, AgentCard>();
   for (const event of state.timeline) {
@@ -204,7 +315,7 @@ function agentsFromState(state: CockpitState): AgentCard[] {
     seen.set(event.by, {
       id: event.by,
       role: event.by.includes('claude') ? 'architect / reviewer' : event.by.includes('codex') ? 'implementer / fixer' : 'agent',
-      status: event.ok === false ? 'blocked' : event.type?.includes('finished') ? 'done' : event.type?.includes('started') ? 'working' : state.selected?.phase ?? 'active',
+      status: event.ok === false ? 'blocked' : event.type?.includes('finished') ? 'done' : event.type?.includes('started') ? 'working' : state.selected?.phase ?? 'waiting',
       last: event.type ?? 'event',
     });
     if (prior && !event.type) seen.set(event.by, prior);
@@ -228,8 +339,8 @@ function artifactLines(state: CockpitState): string[] {
   ];
   const out: string[] = [];
   for (const [name, lines] of sections) {
-    out.push(yellow(name));
-    out.push(...(lines.length ? lines : [dim('not created yet')]).slice(0, 5));
+    out.push(`${yellow(name)}`);
+    out.push(...(lines.length ? lines : [dim('(not created)')]).slice(0, 5));
     out.push('');
   }
   return out;
@@ -244,15 +355,15 @@ function collaborationEventLine(event: CollaborationEvent): string {
 
 function collaborationLines(state: CockpitState): string[] {
   const collab = state.collaboration;
-  if (!collab?.events.length) return ['Shared room: waiting for live agent notes and patch deltas'];
+  if (!collab?.events.length) return [dim('Shared room: waiting for live agent notes and patch deltas')];
   const blockers = collab.blockers.slice(-3).map(collaborationEventLine);
   const warnings = collab.warnings.slice(-3).map(collaborationEventLine);
   const patches = collab.latestPatchDeltas.slice(-4).map(collaborationEventLine);
   return [
-    `Shared room: ${collab.agents.length} agents, ${collab.events.length} events`,
-    ...(blockers.length ? ['Blockers:', ...blockers] : []),
-    ...(warnings.length ? ['Warnings:', ...warnings] : []),
-    ...(patches.length ? ['Live patch deltas:', ...patches] : []),
+    dim(`Shared room: ${collab.agents.length} agents, ${collab.events.length} events`),
+    ...(blockers.length ? [red('Blockers:'), ...blockers.map(b => `  ${b}`)] : []),
+    ...(warnings.length ? [yellow('Warnings:'), ...warnings.map(w => `  ${w}`)] : []),
+    ...(patches.length ? [cyan('Live patch deltas:'), ...patches.map(p => `  ${p}`)] : []),
   ].slice(0, 12);
 }
 
@@ -260,138 +371,244 @@ function decisionSummaryLines(state: CockpitState): string[] {
   const selected = state.selected;
   if (!selected) return ['Status: ready for input', 'Next: /ask, /find, /web, /plan, /code'];
   const diffHeaderCount = state.artifacts.diff.filter((line) => line.startsWith('diff --git ')).length;
-  const patchDeltaCount = new Set((state.collaboration?.latestPatchDeltas ?? []).map((event) => event.file).filter(Boolean)).size;
+  const patchDeltaCount = new Set(state.collaboration?.latestPatchDeltas?.map((e) => e.file).filter(Boolean) ?? []).size;
   const changedFiles = Math.max(diffHeaderCount, patchDeltaCount);
   const verdict = state.verdicts.find((item) => item.verdict.toLowerCase().includes('request')) ?? state.verdicts[0];
   const tests = [...state.timeline].reverse().find((event) => event.type === 'validation.finished');
-  const next = selected.status === 'completed' && !selected.appliedAt ? '[a] apply, [t] rerun tests, or [v] inspect diff' : selected.status === 'blocked' ? '[f] fix blockers or [d] discard' : selected.appliedAt ? '[u] undo or continue' : selected.status === 'running' ? 'wait / refresh cockpit' : '/code or /plan next mission';
+  const next = selected.status === 'completed' && !selected.appliedAt
+    ? '[1] Review diff  [2] Run tests  [3] Apply'
+    : selected.status === 'blocked'
+      ? '[1] Fix blockers  [2] Discard'
+      : selected.appliedAt
+        ? '[1] Undo  [2] Continue'
+        : selected.status === 'running'
+          ? 'Wait / refresh'
+          : '/code or /plan next mission';
   return [
-    `Status: ${selected.status}/${selected.phase}`,
-    `Changed: ${changedFiles ? `${changedFiles} file(s)` : 'no diff yet'}`,
-    `Tests: ${tests ? tests.ok ? 'passed' : 'failed' : 'waiting'}`,
-    `Review: ${verdict ? `${verdict.agent} ${verdict.verdict}` : 'waiting'}`,
-    `Risk: ${selected.status === 'completed' ? 'low after inspect' : selected.status === 'blocked' ? 'needs attention' : 'unknown'}`,
+    `Status: ${bold(selected.status)}/${selected.phase}`,
+    `Changed: ${changedFiles ? bold(`${changedFiles} file(s)`) : dim('no diff yet')}`,
+    `Tests: ${tests ? (tests.ok ? bold(green('PASS')) : bold(red('FAIL'))) : dim('waiting')}`,
+    `Review: ${verdict ? `${verdict.agent} ${verdict.verdict}` : dim('waiting')}`,
+    `Risk: ${selected.status === 'completed' ? green('low') : selected.status === 'blocked' ? red('needs attention') : dim('unknown')}`,
     `Next: ${next}`,
   ];
 }
 
-function promptComposerLines(width: number, activePrompt = ''): string[] {
-  const shownPrompt = activePrompt ? `Prompt: ${activePrompt}█` : 'Prompt: /ask question | /find file | /web topic | /plan <idea> | /code <idea>';
-  return panel('Prompt Composer', [
-    shownPrompt,
-    '/ask /find /web do not require Git. /code and /run will initialize Git in a project folder.',
-  ], width, 4, true);
+// ─── Layout Helpers ───
+
+function threeColumn(left: string[], mid: string[], right: string[], leftW: number, midW: number, gap = 2): string[] {
+  const height = Math.max(left.length, mid.length, right.length);
+  const out: string[] = [];
+  for (let i = 0; i < height; i++) {
+    const l = left[i] ?? '';
+    const m = mid[i] ?? '';
+    const r = right[i] ?? '';
+    out.push(pad(l, leftW) + ' '.repeat(gap) + pad(m, midW) + ' '.repeat(gap) + r);
+  }
+  return out;
+}
+
+// ─── Snapshot / Render Functions ───
+
+function renderMissionHeader(state: CockpitState, width: number): string[] {
+  const selected = state.selected;
+  if (!selected) return [];
+
+  const missionLine = `  ${bold(selected.mission)}`;
+  const statusLine = `  Status: ${bold(selected.status)}  │  Phase: ${selected.phase}  │  Tests: ${state.timeline.some(e => e.type === 'validation.finished' && e.ok) ? green('PASS') : state.timeline.some(e => e.type === 'validation.finished' && !e.ok) ? red('FAIL') : dim('pending')}  │  Risk: ${selected.status === 'completed' ? green('LOW') : selected.status === 'blocked' ? red('HIGH') : dim('unknown')}`;
+  const idLine = `  Run: ${dim(selected.id)}`;
+
+  const contentWidth = width - 4;
+  const lines = [
+    `┌${'─'.repeat(contentWidth)}┐`,
+    pad(missionLine, contentWidth),
+    pad(statusLine, contentWidth),
+    pad(idLine, contentWidth),
+    `└${'─'.repeat(contentWidth)}┘`,
+    '',
+  ];
+  return lines;
+}
+
+function renderEmptyMissionHeader(width: number): string[] {
+  const contentWidth = width - 4;
+  return [
+    `┌${'─'.repeat(contentWidth)}┐`,
+    pad('  Waiting for operator prompt...', contentWidth),
+    `└${'─'.repeat(contentWidth)}┘`,
+    '',
+  ];
+}
+
+function renderAgentsColumn(agents: AgentCard[], width: number, height: number): string[] {
+  const lines: string[] = [bold('AGENTS')];
+  for (const agent of agents) {
+    const statusDisp = agentStatusDisplay(agent.status);
+    lines.push(`${statusDisp.icon} ${statusDisp.color(agent.id)}  ${dim(agent.role)}`);
+    lines.push(`  ${dim(agent.last)}`);
+    lines.push('');
+  }
+  while (lines.length < height) lines.push('');
+  return lines.slice(0, height);
+}
+
+function renderTimelineColumn(state: CockpitState, width: number, height: number): string[] {
+  const lines: string[] = [bold('TIMELINE (live)')];
+
+  const collabLines = collaborationLines(state);
+  for (const line of collabLines.slice(0, 2)) {
+    lines.push(`  ${line}`);
+  }
+  if (collabLines.length > 2) lines.push('');
+
+  const timelineEvents = state.timeline.length ? state.timeline.slice(-8) : [];
+  for (const event of timelineEvents) {
+    const { line } = fmtEvent(event);
+    lines.push(`  ${line}`);
+  }
+
+  while (lines.length < height) lines.push('');
+  return lines.slice(0, height);
+}
+
+function renderArtifactsColumn(state: CockpitState, width: number, height: number): string[] {
+  const lines: string[] = [bold('ARTIFACTS')];
+  const artifacts = artifactLines(state);
+  for (const line of artifacts.slice(0, height - 4)) {
+    lines.push(`  ${line}`);
+  }
+  lines.push('');
+  if (state.selected) {
+    const applied = state.selected.appliedAt ? green('[Applied]') : '';
+    lines.push(`  ${dim('Gate:')}${state.selected.status === 'completed' ? ' ' + green('Ready to apply') : ' ' + dim('waiting')} ${applied}`);
+  } else {
+    lines.push(`  ${dim('Gate:')} waiting for operator prompt`);
+  }
+  while (lines.length < height) lines.push('');
+  return lines.slice(0, height);
+}
+
+function renderActionsFooter(state: CockpitState, width: number): string[] {
+  const selected = state.selected;
+  let actions: string[] = [];
+
+  if (!selected) {
+    actions = [
+      '[1] /ask Question    [2] /find File    [3] /web Search    [4] /plan Mission    [5] /code Mission    [6] Quit',
+    ];
+  } else if (selected.status === 'completed' && !selected.appliedAt) {
+    actions = [
+      '[1] Review diff (v)  [2] Run tests (t)  [3] Apply (a)  [4] Ask agent (q)  [5] New mission  [q] Quit',
+    ];
+  } else if (selected.status === 'blocked') {
+    actions = [
+      '[1] Fix (f)  [2] Discard (d)  [3] Review diff (v)  [4] Ask agent (q)  [q] Quit',
+    ];
+  } else if (selected.status === 'running') {
+    actions = [
+      '[r] Refresh  [v] View diff  [q] Quit',
+    ];
+  } else if (selected.appliedAt) {
+    actions = [
+      '[1] Undo (u)  [2] Continue (c)  [3] Review diff (v)  [q] Quit',
+    ];
+  } else {
+    actions = [
+      '[1] /plan Mission  [2] /code Mission  [3] /ask Question  [q] Quit',
+    ];
+  }
+
+  const contentWidth = width - 4;
+  return [
+    '',
+    `┌${'─'.repeat(contentWidth)}┐`,
+    pad(`  ${actions[0]}`, contentWidth),
+    `└${'─'.repeat(contentWidth)}┘`,
+  ];
+}
+
+function renderPromptComposer(width: number, activePrompt: string, promptError?: string, footerMessage?: string): string[] {
+  const contentWidth = width - 4;
+  const lines: string[] = [
+    `┌${'─'.repeat(contentWidth)}┐`,
+    pad(`  ${activePrompt ? `Prompt: ${activePrompt}█` : 'Prompt: /ask question | /find file | /web topic | /plan <idea> | /code <idea>'}`, contentWidth),
+    pad(`  /ask /find /web do not require Git. /code and /run will initialize Git in a project folder.`, contentWidth),
+    `└${'─'.repeat(contentWidth)}┘`,
+  ];
+  if (promptError) lines.push(red(`  ${promptError}`));
+  if (footerMessage) lines.push(dim(`  ${footerMessage}`));
+  return lines;
 }
 
 function emptyCockpitLines(width: number, activePrompt = ''): string[] {
-  const totalWidth = Math.max(100, width);
-  const leftWidth = Math.max(26, Math.floor(totalWidth * 0.24));
-  const midWidth = Math.max(40, Math.floor(totalWidth * 0.42));
-  const rightWidth = Math.max(34, totalWidth - leftWidth - midWidth);
-  const tabs = ['[1] new mission idle', '[2] parallel task empty', '[3] npm publish blocked/auth'];
   const agents = [
-    `${magenta('claude')} ${green('idle')}  architect/reviewer`,
-    'next: plan, critique, review',
-    '',
-    `${magenta('codex')} ${green('idle')}   implementer/fixer`,
-    'next: code, test, repair',
-    '',
-    `${magenta('tester')} ${dim('queued')} validation gates`,
+    { id: 'claude', role: 'architect / reviewer', status: 'waiting', last: 'ready to plan/review' },
+    { id: 'codex', role: 'implementer / fixer', status: 'waiting', last: 'ready to code/fix' },
+    { id: 'tester', role: 'validation gates', status: 'queued', last: '' },
   ];
-  const timeline = [
-    `${dim('--:--:--')} ${yellow('[ready]')} operator cockpit v2 online`,
-    'Type /ask, /find, /web, /plan, /code, /continue, or /parallel below.',
-    '',
-    `${dim('--:--:--')} ${yellow('[workflow]')} plan → code → test → review → fix → done`,
-    'Agent activity, decisions, and compact logs appear here.',
-  ];
-  const artifacts = [
-    'Plan: not created',
-    'Diff: 0 files',
-    'Tests: waiting',
-    'Review: waiting',
-    'Summary: waiting',
-    '',
-    'Gate: waiting for operator prompt',
-  ];
+
+  const leftW = Math.max(28, Math.floor(width * 0.25));
+  const midW = Math.max(42, Math.floor(width * 0.4));
+  const rightW = width - leftW - midW - 4;
+  const colHeight = 14;
+
   return [
-    `${bold('xdou visual cockpit')} ${dim('operator cockpit v2 for multi-agent co-development')}`,
-    `${cyan('Stage')} idle  ${cyan('Status')} ready/no-run  ${cyan('Mission')} waiting for operator input`,
-    'No action needed. Type a mission or command below.',
-    ...panel('Mission Tabs', tabs, totalWidth, 4, false),
-    ...hjoin([
-      panel('Agents', agents, leftWidth, 12, false),
-      panel('Live Work / Timeline', timeline, midWidth, 12, true),
-      panel('Artifacts / Gates', artifacts, rightWidth, 12, false),
-    ]),
-    ...hjoin([
-      panel('Current Focus', ['Waiting for operator intent.', 'Next: type /ask question, /find file, /web topic, /plan, or /code.'], Math.floor(totalWidth * 0.58), 5, false),
-      panel('Operator Attention', ['No action needed. Type a mission or command below.'], totalWidth - Math.floor(totalWidth * 0.58), 5, false),
-    ]),
-    ...promptComposerLines(totalWidth, activePrompt),
-    actionBarLine(totalWidth),
+    bold('xdou visual cockpit') + ' ' + dim('operator cockpit for multi-agent co-development'),
+    ...renderEmptyMissionHeader(width),
+    ...threeColumn(
+      renderAgentsColumn(agents, leftW, colHeight),
+      renderTimelineColumn({ runs: [], selected: undefined, timeline: [], verdicts: [], artifacts: { plan: [], diff: [], review: [], summary: [] } }, midW, colHeight),
+      renderArtifactsColumn({ runs: [], selected: undefined, timeline: [], verdicts: [], artifacts: { plan: [], diff: [], review: [], summary: [] } }, rightW, colHeight),
+      leftW, midW
+    ),
+    ...renderActionsFooter({ runs: [], selected: undefined, timeline: [], verdicts: [], artifacts: { plan: [], diff: [], review: [], summary: [] } }, width),
+    ...renderPromptComposer(width, activePrompt),
   ];
 }
 
-export function renderCockpitSnapshot(state: CockpitState, width = 100, activePrompt = ''): string {
-  const selected = state.selected;
-  if (!selected) return emptyCockpitLines(width, activePrompt).map(stripAnsi).join('\n');
-
+export function renderCockpitSnapshot(state: CockpitState, width = 120, activePrompt = ''): string {
   const totalWidth = Math.max(100, width);
-  const leftWidth = Math.max(26, Math.floor(totalWidth * 0.24));
-  const midWidth = Math.max(40, Math.floor(totalWidth * 0.42));
-  const rightWidth = Math.max(34, totalWidth - leftWidth - midWidth);
-  const runTabs = (state.runs.length ? state.runs : [selected]).slice(-3).map((run, index) => `${index + 1 === Math.min(3, state.runs.length || 1) ? '●' : '○'} ${run.id} ${run.status}/${run.phase}`);
-  const agentContent = agentsFromState(state).flatMap((agent) => [`${agent.id} ${agent.status}`, agent.role, agent.last, '']);
-  const timelineContent = [
-    ...collaborationLines(state).map((line) => `[shared-room] ${line}`),
-    '',
-    ...(state.timeline.length ? state.timeline.slice(-8).map(fmtEvent) : ['--:--:-- waiting xdou']),
-  ];
-  const focus = [
-    `Run: ${selected.id}`,
-    `Mission: ${selected.mission}`,
-    ...(selected.worktreePath ? [`Worktree: ${selected.worktreePath}`] : []),
-    `Artifacts: ${selected.artifactDir}`,
-  ];
-  const attention = decisionSummaryLines(state);
-  return [
-    `${bold('xdou visual cockpit')} ${dim('operator cockpit v2 for multi-agent co-development')}`,
-    `${cyan('Stage')} ${selected.phase}  ${cyan('Status')} ${selected.status}/${selected.phase}  ${cyan('Mission')} ${truncate(selected.mission, Math.max(10, totalWidth - 42))}`,
-    selected.status === 'blocked' ? 'Action needed. Review blockers, fix, discard, or ask the agents.' : 'No action needed. Inspect, apply, test, continue, or type below.',
-    ...panel('Mission Tabs', runTabs, totalWidth, 4, false),
-    ...hjoin([
-      panel('Agents', agentContent, leftWidth, 12, false),
-      panel('Live Work / Timeline', timelineContent, midWidth, 12, true),
-      panel('Artifacts / Gates', artifactLines(state), rightWidth, 12, false),
-    ]),
-    ...hjoin([
-      panel('Current Focus', focus, Math.floor(totalWidth * 0.58), 7, false),
-      panel('Operator Attention', attention, totalWidth - Math.floor(totalWidth * 0.58), 7, false),
-    ]),
-    ...promptComposerLines(totalWidth, activePrompt),
-    actionBarLine(totalWidth),
-  ].map(stripAnsi).join('\n');
+  const leftW = Math.max(28, Math.floor(totalWidth * 0.25));
+  const midW = Math.max(42, Math.floor(totalWidth * 0.4));
+  const rightW = totalWidth - leftW - midW - 4;
+  const colHeight = 14;
+
+  const lines: string[] = [];
+
+  if (!state.selected) {
+    return emptyCockpitLines(totalWidth, activePrompt).map(stripAnsi).join('\n');
+  }
+
+  // Mission header
+  lines.push(...renderMissionHeader(state, totalWidth));
+
+  // Three columns
+  const agents = agentsFromState(state);
+  lines.push(...threeColumn(
+    renderAgentsColumn(agents, leftW, colHeight),
+    renderTimelineColumn(state, midW, colHeight),
+    renderArtifactsColumn(state, rightW, colHeight),
+    leftW, midW
+  ));
+
+  // Decision summary (compact)
+  lines.push(...decisionSummaryLines(state).map(l => `  ${l}`));
+  lines.push('');
+
+  // Actions footer
+  lines.push(...renderActionsFooter(state, totalWidth));
+
+  // Prompt composer
+  lines.push(...renderPromptComposer(totalWidth, activePrompt));
+
+  return lines.map(stripAnsi).join('\n');
 }
 
-function panel(title: string, content: string[], width: number, height: number, focused: boolean): string[] {
-  const border = focused ? yellow : dim;
-  const titleText = ` ${title} `;
-  const top = border(`┌${titleText}${'─'.repeat(Math.max(0, width - visibleWidth(titleText) - 2))}┐`);
-  const bottom = border(`└${'─'.repeat(Math.max(0, width - 2))}┘`);
-  const bodyHeight = Math.max(0, height - 2);
-  const body = Array.from({ length: bodyHeight }, (_, index) => `${border('│')}${pad(content[index] ?? '', width - 2)}${border('│')}`);
-  return [top, ...body, bottom];
-}
-
-function hjoin(columns: string[][]): string[] {
-  const height = Math.max(...columns.map((column) => column.length));
-  return Array.from({ length: height }, (_, row) => columns.map((column) => column[row] ?? '').join(''));
-}
+// ─── Interactive VisualCockpit ───
 
 class VisualCockpit {
   private focus = 1;
-  private promptMode = true;
+  private promptMode = false;
   private prompt = '';
   private promptError = '';
   private footerMessage = '';
@@ -411,31 +628,39 @@ class VisualCockpit {
     this.stdin.resume();
     this.stdin.on('data', this.inputHandler);
     this.stdout.on('resize', this.resizeHandler);
-    this.stdout.write('\x1b[?25l');
+    // Enter alternate screen buffer
+    this.stdout.write('\x1b[?1049h\x1b[?25l');
     this.renderToTerminal();
   }
 
   private handleInput(data: string): void {
     const chunk = parseCockpitInputChunk(data);
-    if (matchesKey(chunk, 'q') && !this.prompt) { this.shutdown(); return; }
-    if (matchesKey(chunk, 'escape') || matchesKey(chunk, 'ctrl+c')) { this.prompt = ''; this.promptError = ''; this.renderToTerminal(); return; }
+    if (matchesKey(chunk, 'q') && !this.promptMode) { this.shutdown(); return; }
+    if (matchesKey(chunk, 'escape') || matchesKey(chunk, 'ctrl+c')) { this.promptMode = false; this.prompt = ''; this.promptError = ''; this.renderToTerminal(); return; }
     if (matchesKey(chunk, 'tab')) { this.focus = (this.focus + 1) % 3; this.renderToTerminal(); return; }
-    if (!this.prompt && matchesKey(chunk, 'a')) { this.commandSelectedRun('apply'); return; }
-    if (!this.prompt && matchesKey(chunk, 'v')) { this.commandSelectedRun('diff'); return; }
-    if (!this.prompt && matchesKey(chunk, 't')) { this.commandSelectedRun('test'); return; }
-    if (!this.prompt && matchesKey(chunk, 'f')) { this.commandSelectedRun('fix'); return; }
-    if (!this.prompt && matchesKey(chunk, 'u')) { this.commandSelectedRun('undo'); return; }
-    if (!this.prompt && matchesKey(chunk, 'd')) { this.commandSelectedRun('discard'); return; }
-    if (!this.prompt && matchesKey(chunk, 'p')) { this.prompt = '/plan '; this.renderToTerminal(); return; }
-    if (!this.prompt && matchesKey(chunk, 'r')) { this.commandSelectedRun('review'); return; }
-    if (!this.prompt && matchesKey(chunk, 'n')) { this.prompt = ''; this.footerMessage = 'Composer ready — type directly.'; this.renderToTerminal(); return; }
+
+    if (!this.promptMode) {
+      if (matchesKey(chunk, 'a')) { this.commandSelectedRun('apply'); return; }
+      if (matchesKey(chunk, 'v')) { this.commandSelectedRun('diff'); return; }
+      if (matchesKey(chunk, 't')) { this.commandSelectedRun('test'); return; }
+      if (matchesKey(chunk, 'f')) { this.commandSelectedRun('fix'); return; }
+      if (matchesKey(chunk, 'u')) { this.commandSelectedRun('undo'); return; }
+      if (matchesKey(chunk, 'd')) { this.commandSelectedRun('discard'); return; }
+      if (matchesKey(chunk, 'p')) { this.promptMode = true; this.prompt = '/plan '; this.renderToTerminal(); return; }
+      if (matchesKey(chunk, 'r')) { this.commandSelectedRun('review'); return; }
+      if (matchesKey(chunk, 'n')) { this.promptMode = false; this.prompt = ''; this.footerMessage = 'Composer ready — type directly.'; this.renderToTerminal(); return; }
+      if (matchesKey(chunk, 'enter') || chunk === '\r' || chunk === '\n') { this.promptMode = true; this.prompt = ''; this.renderToTerminal(); return; }
+      // Any printable char starts prompt
+      if (/^[\x20-\x7E]+$/.test(chunk)) { this.promptMode = true; this.prompt = chunk; this.renderToTerminal(); return; }
+    }
+
     this.handlePromptInput(chunk);
   }
 
   private handlePromptInput(data: string): void {
     const chunk = parseCockpitInputChunk(data);
     this.promptError = '';
-    if (matchesKey(chunk, 'escape') || matchesKey(chunk, 'ctrl+c')) { this.prompt = ''; this.renderToTerminal(); return; }
+    if (matchesKey(chunk, 'escape') || matchesKey(chunk, 'ctrl+c')) { this.promptMode = false; this.prompt = ''; this.renderToTerminal(); return; }
     if (matchesKey(chunk, 'enter') || chunk === '\r' || chunk === '\n') {
       const command = parseCockpitOperatorCommand(this.prompt);
       if (!command) { this.promptError = 'Type /plan <idea>, /code <idea>, /ask question, /continue, or /parallel <idea>'; this.renderToTerminal(); return; }
@@ -456,19 +681,6 @@ class VisualCockpit {
     this.renderToTerminal();
   }
 
-  private openMissionPrompt(): void {
-    this.promptMode = true;
-    this.prompt = '';
-    this.promptError = '';
-    this.footerMessage = 'Prompt active — type plan/run/code text, Enter launches, Esc cancels.';
-    this.renderToTerminal();
-  }
-
-  private showFooter(message: string): void {
-    this.footerMessage = message;
-    this.renderToTerminal();
-  }
-
   private commandSelectedRun(action: 'apply' | 'diff' | 'review' | 'status' | 'test' | 'fix' | 'discard' | 'undo'): void {
     const runId = this.state.selected?.id;
     if (!runId) { this.showFooter('No run selected yet.'); return; }
@@ -476,61 +688,64 @@ class VisualCockpit {
     this.shutdown();
   }
 
+  private showFooter(message: string): void {
+    this.footerMessage = message;
+    this.renderToTerminal();
+  }
+
   private renderLines(width: number): string[] {
     const selected = this.state.selected;
-    if (!selected) {
-      const lines = emptyCockpitLines(width, this.prompt);
-      return this.promptError || this.footerMessage ? [...lines, this.promptError ? red(this.promptError) : dim(this.footerMessage)] : lines;
-    }
-    const totalWidth = Math.max(96, width);
-    const leftWidth = Math.max(28, Math.floor(totalWidth * 0.25));
-    const rightWidth = Math.max(36, Math.floor(totalWidth * 0.32));
-    const midWidth = Math.max(38, totalWidth - leftWidth - rightWidth);
-    const bodyHeight = 18;
-    const agentContent = agentsFromState(this.state).flatMap((agent) => [
-      `${magenta(agent.id)} ${agent.status === 'blocked' ? red(agent.status) : green(agent.status)}`,
-      dim(agent.role),
-      agent.last,
-      '',
-    ]);
-    const transcript = [
-      ...collaborationLines(this.state).map((line) => `${cyan('[shared-room]')} ${line}`),
-      '',
-      ...(this.state.timeline.length ? this.state.timeline : [{ type: 'waiting', by: 'xdou', time: undefined, verdict: undefined, status: undefined, phase: undefined, ok: undefined }]).slice(-10).flatMap((event) => [
-        `${dim(event.time ? event.time.slice(11, 19) : '--:--:--')} ${yellow(`[${event.type ?? 'event'}]`)} ${cyan(event.by ?? 'system')}`,
-        event.verdict ?? event.status ?? event.phase ?? (event.ok === undefined ? 'event recorded' : event.ok ? 'ok' : 'failed'),
-        '',
-      ]),
-    ];
+    const totalWidth = Math.max(100, width);
+    const leftW = Math.max(28, Math.floor(totalWidth * 0.25));
+    const midW = Math.max(42, Math.floor(totalWidth * 0.4));
+    const rightW = totalWidth - leftW - midW - 4;
+    const colHeight = 14;
 
-    return [
-      `${bold('xdou visual cockpit')} ${dim('mission control for multi-agent co-development')}`,
-      `${cyan('Run')} ${selected.id}  ${cyan('Status')} ${selected.status}/${selected.phase}  ${cyan('Mission')} ${truncate(selected.mission, totalWidth - 60)}`,
-      ...hjoin([
-        panel('Agents', agentContent, leftWidth, bodyHeight, this.focus === 0),
-        panel('Live Council Transcript', transcript, midWidth, bodyHeight, this.focus === 1),
-        panel('Current Artifact', artifactLines(this.state), rightWidth, bodyHeight, this.focus === 2),
-      ]),
-      ...panel('Decision Summary', decisionSummaryLines(this.state), totalWidth, 8, false),
-      ...promptComposerLines(totalWidth, this.prompt),
-      ...(this.promptError ? [red(this.promptError)] : []),
-      ...(this.footerMessage ? [dim(this.footerMessage)] : []),
-      actionBarLine(totalWidth),
-    ];
+    const lines: string[] = [];
+
+    if (!selected) {
+      const emptyLines = emptyCockpitLines(totalWidth, this.promptMode ? this.prompt : '');
+      if (this.promptError) emptyLines.push(red(`  ${this.promptError}`));
+      if (this.footerMessage) emptyLines.push(dim(`  ${this.footerMessage}`));
+      return emptyLines;
+    }
+
+    // Mission header
+    lines.push(...renderMissionHeader(this.state, totalWidth));
+
+    // Three columns
+    const agents = agentsFromState(this.state);
+    lines.push(...threeColumn(
+      renderAgentsColumn(agents, leftW, colHeight),
+      renderTimelineColumn(this.state, midW, colHeight),
+      renderArtifactsColumn(this.state, rightW, colHeight),
+      leftW, midW
+    ));
+
+    // Actions footer
+    lines.push(...renderActionsFooter(this.state, totalWidth));
+
+    // Prompt composer
+    const promptText = this.promptMode ? this.prompt : '';
+    lines.push(...renderPromptComposer(totalWidth, promptText, this.promptError, this.footerMessage));
+
+    return lines;
   }
 
   private renderToTerminal(): void {
     const width = this.stdout.columns || Number(process.env.COLUMNS) || 120;
     const height = this.stdout.rows || Number(process.env.LINES) || 30;
     const lines = this.renderLines(width).slice(0, Math.max(1, height - 1));
-    this.stdout.write(`\x1b[2J\x1b[H${lines.join('\r\n')}`);
+    // Move cursor to home and clear to end of screen (no full-screen clear flicker)
+    this.stdout.write('\x1b[H\x1b[J' + lines.join('\r\n'));
   }
 
   private shutdown(): void {
     this.stdin.off('data', this.inputHandler);
     this.stdout.off('resize', this.resizeHandler);
     if (this.stdin.setRawMode) this.stdin.setRawMode(this.wasRaw);
-    this.stdout.write('\x1b[?25h\r\n');
+    // Exit alternate screen buffer
+    this.stdout.write('\x1b[?1049l\x1b[?25h\r\n');
     this.onExit(this.result);
   }
 }
@@ -541,4 +756,3 @@ export async function launchCockpit(state: CockpitState): Promise<CockpitLaunchR
     app.start();
   });
 }
-

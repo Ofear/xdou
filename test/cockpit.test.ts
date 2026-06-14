@@ -51,45 +51,79 @@ describe('cockpit command', () => {
     const cwd = temporaryDirectory();
     const runId = seedRun(cwd);
     const result = await runCli(['cockpit', '--snapshot', '--cwd', cwd]);
-    expect(result.stdout).toContain('xdou visual cockpit');
+    // New format: mission header box (no title line for selected runs)
     expect(result.stdout).toContain(runId);
     expect(result.stdout).toContain('add terminal cockpit');
-    expect(result.stdout).toContain('blocked/review');
-    expect(result.stdout).toContain('claude request_changes');
-    expect(result.stdout).toContain('┌ Mission Tabs ');
-    expect(result.stdout).toContain('┌ Agents ');
-    expect(result.stdout).toContain('┌ Live Work / Timeline ');
-    expect(result.stdout).toContain('┌ Artifacts / Gates ');
-    expect(result.stdout).toContain('┌ Current Focus ');
-    expect(result.stdout).toContain('┌ Operator Attention ');
-    expect(result.stdout).toContain('┌ Prompt Composer ');
+    expect(result.stdout).toContain('Status: blocked');
+    expect(result.stdout).toContain('Phase: review');
+    expect(result.stdout).toContain('Tests: FAIL');
+    expect(result.stdout).toContain('Risk: HIGH');
+    // Human-readable events
+    expect(result.stdout).toContain('Run started');
+    expect(result.stdout).toContain('Tests failed');
+    expect(result.stdout).toContain('Review complete');
+    // Agent status icons
+    expect(result.stdout).toContain('🔴');
+    expect(result.stdout).toContain('👁');
+    // Three columns (no box borders)
+    expect(result.stdout).toContain('AGENTS');
+    expect(result.stdout).toContain('TIMELINE (live)');
+    expect(result.stdout).toContain('ARTIFACTS');
+    // Actions footer box
+    expect(result.stdout).toContain('[1] Fix (f)');
+    expect(result.stdout).toContain('[2] Discard (d)');
+    expect(result.stdout).toContain('[3] Review diff (v)');
+    // Prompt composer box
+    expect(result.stdout).toContain('Prompt: /ask question');
+    expect(result.stdout).toContain('/ask /find /web do not require Git');
+    // No old boxed panels
+    expect(result.stdout).not.toContain('┌ Mission Tabs ');
+    expect(result.stdout).not.toContain('┌ Current Focus ');
+    expect(result.stdout).not.toContain('┌ Operator Attention ');
     expect(result.stdout).not.toContain('xdou cockpit — visual mission control');
     expect(result.stdout).toContain('Changed: 1 file(s)');
-    expect(result.stdout).toContain('Tests: failed');
     expect(result.stdout).toContain('Review: claude request_changes');
-    expect(result.stdout).toContain('[v] diff [r] review [t] test [f] fix');
   });
 
   it('renders an empty cockpit as an operator cockpit v2, not a plain launcher', async () => {
     const cwd = temporaryDirectory();
     const result = await runCli(['cockpit', '--snapshot', '--cwd', cwd]);
     expect(result.stdout).toContain('xdou visual cockpit');
-    expect(result.stdout).toContain('┌ Mission Tabs ');
-    expect(result.stdout).toContain('┌ Agents ');
-    expect(result.stdout).toContain('┌ Live Work / Timeline ');
-    expect(result.stdout).toContain('┌ Artifacts / Gates ');
-    expect(result.stdout).toContain('┌ Current Focus ');
-    expect(result.stdout).toContain('┌ Operator Attention ');
-    expect(result.stdout).toContain('┌ Prompt Composer ');
-    expect(result.stdout).toContain('No action needed. Type a mission or command below.');
-    expect(result.stdout).toContain('[1] new mission idle');
-    expect(result.stdout).toContain('[2] parallel task empty');
+    // Empty mission header box
+    expect(result.stdout).toContain('Waiting for operator prompt...');
+    // Three columns with default agents - note: role truncated due to column width
+    expect(result.stdout).toContain('AGENTS');
+    expect(result.stdout).toContain('⚪ claude');
+    expect(result.stdout).toContain('architect / rev'); // truncated
+    expect(result.stdout).toContain('⚪ codex');
+    expect(result.stdout).toContain('implementer / fixer');
+    expect(result.stdout).toContain('⚪ tester');
+    expect(result.stdout).toContain('validation gates');
+    expect(result.stdout).toContain('TIMELINE (live)');
+    expect(result.stdout).toContain('Shared room: waiting');
+    expect(result.stdout).toContain('ARTIFACTS');
+    expect(result.stdout).toContain('plan.md');
+    expect(result.stdout).toContain('(not created)');
+    // Actions footer
+    expect(result.stdout).toContain('[1] /ask Question');
+    expect(result.stdout).toContain('[2] /find File');
+    expect(result.stdout).toContain('[3] /web Search');
+    expect(result.stdout).toContain('[4] /plan Mission');
+    expect(result.stdout).toContain('[5] /code Mission');
+    expect(result.stdout).toContain('[6] Quit');
+    // Prompt composer
+    expect(result.stdout).toContain('Prompt: /ask question');
     expect(result.stdout).toContain('/ask /find /web do not require Git. /code and /run will initialize Git in a project folder.');
+    // No old boxed panels
+    expect(result.stdout).not.toContain('┌ Mission Tabs ');
+    expect(result.stdout).not.toContain('┌ Current Focus ');
+    expect(result.stdout).not.toContain('┌ Operator Attention ');
+    expect(result.stdout).not.toContain('[1] new mission idle');
+    expect(result.stdout).not.toContain('[2] parallel task empty');
   });
 
   it('documents cockpit keyboard controls consistently with the action bar', () => {
     const readme = readFileSync(join(repoRoot, 'README.md'), 'utf8');
-
     expect(readme).toContain('p    start /plan prompt');
     expect(readme).toContain('t    rerun tests');
     expect(readme).toContain('f    fix blockers');
@@ -119,7 +153,6 @@ describe('cockpit command', () => {
     expect(parseCockpitOperatorCommand('/review 20260102030405-deadbeef')).toEqual({ action: 'review', runId: '20260102030405-deadbeef' });
     expect(parseCockpitOperatorCommand('/status')).toEqual({ action: 'status' });
     expect(parseCockpitOperatorCommand('/apply 20260102030405-deadbeef')).toEqual({ action: 'apply', runId: '20260102030405-deadbeef' });
-
     expect(parseCockpitOperatorCommand('/code build mission tabs')).toEqual({ action: 'run', mission: 'build mission tabs' });
   });
 
@@ -140,7 +173,7 @@ describe('cockpit command', () => {
     const output = renderCockpitSnapshot({ runs: [], selected: undefined, timeline: [], verdicts: [], artifacts: { plan: [], diff: [], review: [], summary: [] } }, 140);
     const maxLineWidth = Math.max(...output.split('\n').map((line) => [...line].length));
     expect(maxLineWidth).toBeLessThanOrEqual(140);
-    expect(output).toContain('architect/reviewer');
+    expect(output).toContain('architect / rev'); // truncated in column
     expect(output).toContain('operator prompt');
   });
 
@@ -164,7 +197,11 @@ describe('cockpit command', () => {
       },
     }, 120);
 
-    expect(output).toContain('Changed: 3 file(s)');
+    expect(output).toContain('Changed:');
+    expect(output).toContain('3 file(s)');
+    expect(output).toContain('Status: completed');
+    expect(output).toContain('Tests: PASS');
+    expect(output).toContain('Risk: LOW');
   });
 
   it('normalizes bracketed paste and multi-character terminal input for the live prompt', () => {
@@ -175,9 +212,7 @@ describe('cockpit command', () => {
   it('suggests a safe project folder and approval path instead of dead-ending real coding missions from home', async () => {
     const home = process.env.USERPROFILE || process.env.HOME;
     expect(home).toBeTruthy();
-
     const result = await runCli(['run', 'build', 'todo', 'app', '--cwd', home as string], false);
-
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain('Coding missions need a project folder.');
     expect(result.stderr).toContain('Suggested project folder:');
@@ -189,9 +224,7 @@ describe('cockpit command', () => {
   it('rejects underspecified CLI coding missions before suggesting or creating a project folder', async () => {
     const home = process.env.USERPROFILE || process.env.HOME;
     expect(home).toBeTruthy();
-
     const result = await runCli(['run', 'hi', '--cwd', home as string], false);
-
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain('That does not look like a coding mission yet.');
     expect(result.stderr).toContain('/ask hi');
