@@ -1,5 +1,6 @@
 import fs from 'fs-extra';
 import { join } from 'node:path';
+import { homedir } from 'node:os';
 import { matchesKey, truncateToWidth, visibleWidth } from '@earendil-works/pi-tui';
 import stripAnsi from 'strip-ansi';
 import type { ArtifactStore } from '../core/artifact-store.js';
@@ -466,6 +467,27 @@ function renderMissionHeader(state: CockpitState, width: number): string[] {
   return lines;
 }
 
+// Replace the home dir with ~ so the path stays short and recognizable in the header.
+export function contractHome(path: string): string {
+  const home = homedir();
+  return home && (path === home || path.startsWith(`${home}/`)) ? `~${path.slice(home.length)}` : path;
+}
+
+export function formatCharCount(chars: number): string {
+  return chars >= 1000 ? `${(chars / 1000).toFixed(1)}k chars` : `${chars} chars`;
+}
+
+// One-line workspace bar: where we are (path), the branch (or "no git"), and how full the chat
+// context is. Always visible regardless of mission state. Left unpadded (like the title line) — the
+// per-frame home+clear wipes any trailing content, and padding to full width would trip the
+// width-1 truncation clamp in renderToTerminal and append a stray "…".
+function renderWorkspaceBar(cwd: string, branch: string | undefined, contextChars: number, turns: number): string {
+  const place = bold(contractHome(cwd));
+  const ref = branch ? `${dim('⎇')} ${branch}` : dim('no git');
+  const ctx = dim(`context: ${formatCharCount(contextChars)} · ${turns} turn${turns === 1 ? '' : 's'}`);
+  return `  ${place}  ${ref}   ${dim('·')}   ${ctx}`;
+}
+
 function renderEmptyMissionHeader(width: number): string[] {
   const contentWidth = width - 4;
   return [
@@ -724,6 +746,8 @@ export interface CockpitLaunchOptions {
   summarizedCount?: number;
   onPersist?: (snapshot: CockpitPersistSnapshot) => void; // persist after each conversation change
   roster?: CockpitRosterAgent[];                          // agents that can be toggled on/off
+  cwd?: string;                                           // working directory shown in the header
+  branch?: string | undefined;                            // current git branch, or undefined if no repo
 }
 
 // Distinct, stable color per author so it's obvious at a glance who wrote what in the OUTPUT panel.
@@ -912,6 +936,8 @@ class VisualCockpit {
   private readonly disabledAgents = new Set<string>(); // roster agents the operator has turned off
   private readonly roster: CockpitRosterAgent[];
   private readonly sessionId: string | undefined;
+  private readonly cwd: string;
+  private readonly branch: string | undefined;
   private readonly onPersist: ((snapshot: CockpitPersistSnapshot) => void) | undefined;
   private readonly stdin = process.stdin;
   private readonly stdout = process.stdout;
@@ -929,6 +955,8 @@ class VisualCockpit {
     if (this.summary && this.summarizedCount === 0) this.summarizedCount = this.conversation.length;
     this.roster = options.roster ?? [];
     this.sessionId = options.sessionId;
+    this.cwd = options.cwd ?? process.cwd();
+    this.branch = options.branch;
     this.onPersist = options.onPersist;
   }
 
@@ -1263,7 +1291,7 @@ class VisualCockpit {
 
     // Divide the remaining vertical space between the dashboard columns and the OUTPUT panel so the
     // whole frame fits one screenful (no wrap/scroll) regardless of terminal height.
-    const fixed = 1 + header.length + actions.length + composer.length;
+    const fixed = 1 + 1 + header.length + actions.length + composer.length; // title + workspace bar + header + actions + composer
     const body = Math.max(8, (height - 1) - fixed);
     // Favor the OUTPUT panel: the dashboard columns take a smaller, capped slice and the rest goes
     // to the conversation so longer replies are visible without scrolling.
@@ -1275,8 +1303,10 @@ class VisualCockpit {
     const agentsCol = this.roster.length
       ? renderRosterColumn(this.roster, this.disabledAgents, colHeight)
       : renderAgentsColumn(agentsFromState(this.state), leftW, colHeight);
+    const workspace = renderWorkspaceBar(this.cwd, this.branch, this.contextChars(), this.contextTurns().length);
     return [
       title,
+      workspace,
       ...header,
       ...threeColumn(
         agentsCol,

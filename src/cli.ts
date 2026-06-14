@@ -15,7 +15,7 @@ import { deleteSession, isEmptySession, listSessions, newSessionId, pruneEmptySe
 import { filterTeam, teamRoster } from './core/cockpit-team.js';
 import { buildAssistantPrompt, buildSummaryPrompt, buildWebSearchPrompt, parseWebProvenance } from './core/assistant-prompt.js';
 import { shouldAnswerAskLocally } from './core/ask-routing.js';
-import { isGitRepo, hasGitHead, isWorkingTreeClean } from './core/repo.js';
+import { isGitRepo, hasGitHead, isWorkingTreeClean, currentBranch } from './core/repo.js';
 import { selectAgents } from './agents/registry.js';
 import { runLoopCommand, type LoopCommandContext } from './commands/loop.js';
 import { runGoalCommand } from './commands/goal.js';
@@ -367,7 +367,8 @@ class Xdou extends Command {
     // Create the session on disk up front so the id we print always resolves on resume,
     // even if the operator quits before sending a message.
     persist({ entries: history, summary: startSummary, summarizedCount: startSummarizedCount });
-    await launchCockpit(state, controller, { sessionId, history, summary: startSummary, summarizedCount: startSummarizedCount, onPersist: persist, roster: teamRoster(team) });
+    const branch = (await isGitRepo(orchestrator.cwd)) ? await currentBranch(orchestrator.cwd) : undefined;
+    await launchCockpit(state, controller, { sessionId, history, summary: startSummary, summarizedCount: startSummarizedCount, onPersist: persist, roster: teamRoster(team), cwd: orchestrator.cwd, branch });
     await persistChain;
     // A session that never got a real message (quit before chatting) is noise — drop it and say
     // nothing about resuming. Only advertise the resume id when there's an actual conversation to resume.

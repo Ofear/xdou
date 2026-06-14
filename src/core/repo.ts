@@ -56,6 +56,16 @@ export async function gitDiff(cwd: string, artifactDir = '.xdou'): Promise<strin
   }
 }
 export async function currentHead(cwd: string): Promise<string> { const r = await execa('git', ['rev-parse', 'HEAD'], { cwd }); return r.stdout.trim(); }
+// Branch name for display. `symbolic-ref` reports the branch even in a fresh repo with no commits;
+// on a detached HEAD it fails, so we fall back to a short commit sha. Returns undefined outside a repo.
+export async function currentBranch(cwd: string): Promise<string | undefined> {
+  try {
+    const r = await execa('git', ['symbolic-ref', '--short', 'HEAD'], { cwd });
+    return r.stdout.trim() || undefined;
+  } catch {
+    try { const r = await execa('git', ['rev-parse', '--short', 'HEAD'], { cwd }); return r.stdout.trim() ? `detached@${r.stdout.trim()}` : undefined; } catch { return undefined; }
+  }
+}
 export async function createRunWorktree(repoRoot: string, runId: string, artifactDir = '.xdou'): Promise<RunWorkspace> {
   const baseRef = await currentHead(repoRoot);
   const worktreePath = join(repoRoot, artifactDir, 'worktrees', runId);

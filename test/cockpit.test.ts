@@ -3,7 +3,8 @@ import { temporaryDirectory } from 'tempy';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { execa } from 'execa';
-import { parseCockpitInputChunk, parseCockpitMissionCommand, parseCockpitOperatorCommand, renderCockpitSnapshot, renderMarkdownLines } from '../src/tui/cockpit.js';
+import { contractHome, formatCharCount, parseCockpitInputChunk, parseCockpitMissionCommand, parseCockpitOperatorCommand, renderCockpitSnapshot, renderMarkdownLines } from '../src/tui/cockpit.js';
+import { homedir } from 'node:os';
 import stripAnsi from 'strip-ansi';
 
 const repoRoot = resolve(__dirname, '..');
@@ -272,5 +273,21 @@ describe('cockpit command', () => {
     expect(result.stderr).toContain('That does not look like a coding mission yet.');
     expect(result.stderr).toContain('/ask hi');
     expect(result.stderr).not.toContain('Suggested project folder:');
+  });
+});
+
+describe('workspace header helpers', () => {
+  it('contracts the home directory to ~', () => {
+    expect(contractHome(join(homedir(), 'Projects', 'x'))).toBe('~/Projects/x');
+    expect(contractHome(homedir())).toBe('~');
+    expect(contractHome('/etc/hosts')).toBe('/etc/hosts');     // outside home: unchanged
+    expect(contractHome(`${homedir()}-other/x`)).toBe(`${homedir()}-other/x`); // prefix-but-not-child: unchanged
+  });
+
+  it('formats context char counts with a k suffix past 1000', () => {
+    expect(formatCharCount(0)).toBe('0 chars');
+    expect(formatCharCount(999)).toBe('999 chars');
+    expect(formatCharCount(1000)).toBe('1.0k chars');
+    expect(formatCharCount(4137)).toBe('4.1k chars');
   });
 });
