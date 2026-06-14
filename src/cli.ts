@@ -21,6 +21,7 @@ import { runLoopCommand, type LoopCommandContext } from './commands/loop.js';
 import { runGoalCommand } from './commands/goal.js';
 import { runLoopsCommand } from './commands/loops.js';
 import { runPluginsCommand, type PluginCommandContext } from './commands/plugins.js';
+import { installCrashHandlers } from './core/crash-log.js';
 import type { DaemonInvocation } from './core/loop-engine.js';
 
 interface ProjectResolutionOptions { project?: string | undefined; yes?: boolean; noInit?: boolean; dryRun?: boolean }
@@ -654,6 +655,19 @@ class Xdou extends Command {
     return { execPath: process.execPath, argv };
   }
 }
+
+// Resolve the working dir the same way the --cwd flag would, so a crash before/while flags are parsed
+// still logs to the right project's .xdou/logs/.
+function cwdFromArgv(): string {
+  const argv = process.argv;
+  const inline = argv.find((arg) => arg.startsWith('--cwd='));
+  if (inline) { return inline.slice('--cwd='.length); }
+  const index = argv.indexOf('--cwd');
+  const next = index >= 0 ? argv[index + 1] : undefined;
+  return next ?? process.cwd();
+}
+
+installCrashHandlers(cwdFromArgv);
 
 void Xdou.run().catch((error: unknown) => {
   const message = error instanceof Error ? error.message : String(error);
