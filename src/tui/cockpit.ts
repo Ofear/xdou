@@ -587,6 +587,64 @@ function renderActionsFooter(state: CockpitState, width: number): string[] {
   ];
 }
 
+// Single source of truth for the slash-command menu. `arg` controls what Enter does on a highlighted
+// item: 'required' tees up "/name " and waits for the operator to type the argument; 'optional'/'none'
+// run immediately. Keep names aligned with the parsers in parseCockpitOperatorCommand.
+export interface SlashCommand { name: string; arg: 'required' | 'optional' | 'none'; desc: string }
+export const SLASH_COMMANDS: SlashCommand[] = [
+  { name: 'ask', arg: 'required', desc: 'Ask a question — chat with the assistant' },
+  { name: 'find', arg: 'required', desc: 'Find files by name/content in this folder' },
+  { name: 'web', arg: 'required', desc: 'Live web research with cited, labeled sources' },
+  { name: 'plan', arg: 'required', desc: 'Plan a coding mission (no code changes)' },
+  { name: 'code', arg: 'required', desc: 'Run a coding mission end-to-end' },
+  { name: 'parallel', arg: 'required', desc: 'Fork the mission across multiple agents' },
+  { name: 'diff', arg: 'optional', desc: 'Show changes for a run [run-id]' },
+  { name: 'review', arg: 'optional', desc: 'Run reviewers on a run [run-id]' },
+  { name: 'test', arg: 'optional', desc: 'Re-run validation/tests [run-id]' },
+  { name: 'apply', arg: 'optional', desc: "Apply a run's changes to the working tree [run-id]" },
+  { name: 'undo', arg: 'optional', desc: 'Undo an applied run [run-id]' },
+  { name: 'fix', arg: 'optional', desc: 'Run the fixer on a blocked run [run-id]' },
+  { name: 'discard', arg: 'optional', desc: 'Discard a run [run-id]' },
+  { name: 'status', arg: 'optional', desc: 'Show status of a run [run-id]' },
+  { name: 'continue', arg: 'none', desc: 'Continue the current run' },
+  { name: 'agents', arg: 'none', desc: 'List agents and their on/off state' },
+  { name: 'enable', arg: 'required', desc: 'Enable an agent — /enable <id>' },
+  { name: 'disable', arg: 'required', desc: 'Disable an agent — /disable <id>' },
+  { name: 'context', arg: 'none', desc: 'Show chat context size & summary' },
+  { name: 'summarize', arg: 'none', desc: 'Compact the conversation now' },
+  { name: 'clear', arg: 'none', desc: 'Clear context — agents start fresh' },
+];
+
+export function filterSlashCommands(filter: string): SlashCommand[] {
+  const f = filter.toLowerCase();
+  return SLASH_COMMANDS.filter((cmd) => cmd.name.startsWith(f));
+}
+
+// Claude-Code-style command palette: a bordered list of matching commands with descriptions, the
+// highlighted row inverse-video. Windows around the selection so a long list stays one screenful.
+function renderSlashMenu(items: SlashCommand[], index: number, width: number, maxRows = 8): string[] {
+  const contentWidth = width - 4;
+  const nameCol = Math.max(...items.map((c) => c.name.length)) + 3;
+  const start = Math.max(0, Math.min(index - Math.floor(maxRows / 2), items.length - maxRows));
+  const window = items.slice(Math.max(0, start), Math.max(0, start) + maxRows);
+  const rows = window.map((cmd) => {
+    const i = items.indexOf(cmd);
+    const name = `/${cmd.name}`.padEnd(nameCol);
+    const raw = `  ${name}${cmd.desc}`;
+    const line = truncate(raw, contentWidth);
+    return i === index ? inverse(pad(line, contentWidth)) : `${line}${' '.repeat(Math.max(0, contentWidth - visibleWidth(line)))}`;
+  });
+  const more = items.length > maxRows ? dim(`  … ${items.length - maxRows} more — keep typing to filter`) : '';
+  return [
+    '',
+    `┌${'─'.repeat(contentWidth)}┐`,
+    pad(`  ${bold('commands')}  ${dim('↑/↓ select · Enter run · Tab complete · Esc cancel')}`, contentWidth),
+    ...rows,
+    ...(more ? [more] : []),
+    `└${'─'.repeat(contentWidth)}┘`,
+  ];
+}
+
 // Hard-wrap `label + prompt` (honouring explicit \n line breaks) to `width` cells per row and draw
 // a reverse-video block cursor at `cursor` (an index into `prompt`). Never truncates the operator's
 // own input — long lines wrap to more rows instead.
@@ -926,6 +984,7 @@ class VisualCockpit {
   private spinnerTick = 0;
   private spinnerTimer: ReturnType<typeof setInterval> | undefined;
   private scroll = 0;
+  private menuIndex = 0; // highlighted row in the slash-command palette
   private done = false;
   private suspended = false; // alt screen dropped for a streaming mission — never paint over it
   private pendingMission: { command: CockpitOperatorCommand; text: string } | undefined; // awaiting y/N confirmation
@@ -1029,6 +1088,18 @@ class VisualCockpit {
     if (this.busy) return; // ignore keystrokes while a command is running
     if (this.pendingMission) { await this.resolvePendingMission(chunk); return; } // waiting on y/N confirm
 
+    // Slash-command palette: while it's open, ↑/↓ move the selection, Tab completes, Enter runs the
+    // highlighted command, and Esc closes it. Other keys fall through to normal editing (re-filtering).
+    const menu = this.menuItems();
+    if (menu.length) {
+      this.menuIndex = Math.max(0, Math.min(this.menuIndex, menu.length - 1));
+      if (chunk === '\x1b[A' || chunk === '\x1bOA') { this.menuIndex = (this.menuIndex - 1 + menu.length) % menu.length; this.renderToTerminal(); return; }
+      if (chunk === '\x1b[B' || chunk === '\x1bOB') { this.menuIndex = (this.menuIndex + 1) % menu.length; this.renderToTerminal(); return; }
+      if (chunk === '\t') { const item = menu[this.menuIndex]; if (item) this.completeMenu(item); return; }
+      if (matchesKey(chunk, 'enter') || chunk === '\r' || chunk === '\n') { const item = menu[this.menuIndex]; if (item) await this.acceptMenu(item); return; }
+      if (matchesKey(chunk, 'escape')) { this.prompt = ''; this.cursor = 0; this.menuIndex = 0; this.renderToTerminal(); return; }
+    }
+
     // PgUp/PgDn scroll the OUTPUT panel. (Arrow/page escapes contain \x1b so they never match the
     // printable-character test used for prompt typing.)
     if (chunk === '\x1b[5~') { this.scroll += 5; this.renderToTerminal(); return; }
@@ -1096,32 +1167,7 @@ class VisualCockpit {
         this.renderToTerminal();
         return;
       }
-      const text = this.prompt.trim();
-      // Manual context compaction (async, needs the assistant agent).
-      const lc = text.replace(/^\//, '').toLowerCase();
-      if (lc === 'summarize' || lc === 'compact') {
-        this.prompt = '';
-        this.cursor = 0;
-        this.push({ author: 'you', text, mine: true });
-        this.startSpinner();
-        try { await this.runSummary(false); } finally { this.stopSpinner(); this.renderToTerminal(); }
-        return;
-      }
-      // Cockpit-local commands (agent toggles, context, help) handled here without touching the controller.
-      if (this.tryLocalCommand(text)) { this.prompt = ''; this.cursor = 0; this.renderToTerminal(); return; }
-      const command = parseCockpitOperatorCommand(text);
-      if (!command) { this.promptError = 'Type /plan <idea>, /code <idea>, /ask question, /continue, or /parallel <idea>'; this.renderToTerminal(); return; }
-      this.prompt = '';
-      this.cursor = 0;
-      this.push({ author: 'you', text, mine: true });
-      // Plain prose that only *looks* like a coding mission: confirm before launching agents.
-      if ((command.action === 'run' || command.action === 'plan') && !isExplicitMissionCommand(text)) {
-        this.pendingMission = { command, text };
-        this.push({ author: 'system', text: `This looks like a coding mission: "${command.mission}". Press y to run the agents, or any other key to send it as a chat question instead.` });
-        this.renderToTerminal();
-        return;
-      }
-      await this.dispatch(command);
+      await this.submitPrompt();
       return;
     }
     if (matchesKey(chunk, 'backspace') || chunk === '\x7f' || chunk === '\b') {
@@ -1129,11 +1175,45 @@ class VisualCockpit {
         this.prompt = this.prompt.slice(0, this.cursor - 1) + this.prompt.slice(this.cursor);
         this.cursor -= 1;
       }
+      this.menuIndex = 0;
     } else if (/^[\x20-\x7E]+$/.test(chunk)) {
       this.prompt = this.prompt.slice(0, this.cursor) + chunk + this.prompt.slice(this.cursor);
       this.cursor += chunk.length;
+      this.menuIndex = 0; // editing the command token re-filters the palette from the top
     }
     this.renderToTerminal();
+  }
+
+  // Run whatever is in the prompt: context compaction, a cockpit-local command, or an operator
+  // command dispatched to the controller. Shared by Enter and the slash-menu accept path.
+  private async submitPrompt(): Promise<void> {
+    const text = this.prompt.trim();
+    if (!text) { this.renderToTerminal(); return; }
+    // Manual context compaction (async, needs the assistant agent).
+    const lc = text.replace(/^\//, '').toLowerCase();
+    if (lc === 'summarize' || lc === 'compact') {
+      this.prompt = '';
+      this.cursor = 0;
+      this.push({ author: 'you', text, mine: true });
+      this.startSpinner();
+      try { await this.runSummary(false); } finally { this.stopSpinner(); this.renderToTerminal(); }
+      return;
+    }
+    // Cockpit-local commands (agent toggles, context, help) handled here without touching the controller.
+    if (this.tryLocalCommand(text)) { this.prompt = ''; this.cursor = 0; this.renderToTerminal(); return; }
+    const command = parseCockpitOperatorCommand(text);
+    if (!command) { this.promptError = 'Type /plan <idea>, /code <idea>, /ask question, /continue, or /parallel <idea>'; this.renderToTerminal(); return; }
+    this.prompt = '';
+    this.cursor = 0;
+    this.push({ author: 'you', text, mine: true });
+    // Plain prose that only *looks* like a coding mission: confirm before launching agents.
+    if ((command.action === 'run' || command.action === 'plan') && !isExplicitMissionCommand(text)) {
+      this.pendingMission = { command, text };
+      this.push({ author: 'system', text: `This looks like a coding mission: "${command.mission}". Press y to run the agents, or any other key to send it as a chat question instead.` });
+      this.renderToTerminal();
+      return;
+    }
+    await this.dispatch(command);
   }
 
   // Resolve a confirmation for an auto-detected coding mission: 'y' runs the agents, anything else
@@ -1148,6 +1228,27 @@ class VisualCockpit {
       this.push({ author: 'system', text: 'Sending it as a chat question instead.' });
       await this.dispatch({ action: 'ask', prompt: pending.text });
     }
+  }
+
+  // The slash palette is active while the operator is typing the command token: prompt starts with
+  // "/", has no space yet, and at least one command matches. Once a space (args) is typed, it closes.
+  private menuItems(): SlashCommand[] {
+    if (!this.prompt.startsWith('/') || /\s/.test(this.prompt)) return [];
+    return filterSlashCommands(this.prompt.slice(1));
+  }
+
+  private completeMenu(cmd: SlashCommand): void { // Tab: fill "/name " and keep composing
+    this.prompt = `/${cmd.name} `;
+    this.cursor = this.prompt.length;
+    this.renderToTerminal();
+  }
+
+  // Enter on a palette item: required-arg commands tee up "/name " and wait; others run immediately.
+  private async acceptMenu(cmd: SlashCommand): Promise<void> {
+    if (cmd.arg === 'required') { this.prompt = `/${cmd.name} `; this.cursor = this.prompt.length; this.menuIndex = 0; this.renderToTerminal(); return; }
+    this.prompt = `/${cmd.name}`;
+    this.cursor = this.prompt.length;
+    await this.submitPrompt();
   }
 
   // Agent enable/disable + help, handled entirely inside the cockpit. Returns true if it consumed
@@ -1284,14 +1385,18 @@ class VisualCockpit {
     const rightW = totalWidth - leftW - midW - 4;
 
     const sessionTag = this.sessionId ? dim(` · session ${this.sessionId}`) : '';
-    const title = bold('xdou cockpit') + ' ' + dim('· type to chat · Ctrl+C quits') + sessionTag;
+    const title = bold('xdou cockpit') + ' ' + dim('· type to chat · / for commands · Ctrl+C quits') + sessionTag;
     const header = this.state.selected ? renderMissionHeader(this.state, totalWidth) : renderEmptyMissionHeader(totalWidth);
-    const actions = renderActionsFooter(this.state, totalWidth);
+    // While the slash palette is open it replaces the action hints below the OUTPUT panel.
+    const menu = this.menuItems();
+    const footer = menu.length
+      ? renderSlashMenu(menu, Math.max(0, Math.min(this.menuIndex, menu.length - 1)), totalWidth)
+      : renderActionsFooter(this.state, totalWidth);
     const composer = renderPromptComposer(totalWidth, this.prompt, this.promptError, this.footerMessage, this.cursor);
 
     // Divide the remaining vertical space between the dashboard columns and the OUTPUT panel so the
     // whole frame fits one screenful (no wrap/scroll) regardless of terminal height.
-    const fixed = 1 + 1 + header.length + actions.length + composer.length; // title + workspace bar + header + actions + composer
+    const fixed = 1 + 1 + header.length + footer.length + composer.length; // title + workspace bar + header + footer/menu + composer
     const body = Math.max(8, (height - 1) - fixed);
     // Favor the OUTPUT panel: the dashboard columns take a smaller, capped slice and the rest goes
     // to the conversation so longer replies are visible without scrolling.
@@ -1315,7 +1420,7 @@ class VisualCockpit {
         leftW, midW, rightW,
       ),
       ...renderOutputPanel(this.conversation, totalWidth, outHeight, this.scroll, this.busyLabel()),
-      ...actions,
+      ...footer,
       ...composer,
     ];
   }

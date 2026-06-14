@@ -3,7 +3,7 @@ import { temporaryDirectory } from 'tempy';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { execa } from 'execa';
-import { contractHome, formatCharCount, parseCockpitInputChunk, parseCockpitMissionCommand, parseCockpitOperatorCommand, renderCockpitSnapshot, renderMarkdownLines } from '../src/tui/cockpit.js';
+import { SLASH_COMMANDS, contractHome, filterSlashCommands, formatCharCount, parseCockpitInputChunk, parseCockpitMissionCommand, parseCockpitOperatorCommand, renderCockpitSnapshot, renderMarkdownLines } from '../src/tui/cockpit.js';
 import { homedir } from 'node:os';
 import stripAnsi from 'strip-ansi';
 
@@ -289,5 +289,25 @@ describe('workspace header helpers', () => {
     expect(formatCharCount(999)).toBe('999 chars');
     expect(formatCharCount(1000)).toBe('1.0k chars');
     expect(formatCharCount(4137)).toBe('4.1k chars');
+  });
+});
+
+describe('slash command palette', () => {
+  it('lists all commands for a bare "/" and filters by prefix', () => {
+    expect(filterSlashCommands('')).toEqual(SLASH_COMMANDS);                       // bare "/" → everything
+    expect(filterSlashCommands('c').map((c) => c.name)).toEqual(['code', 'continue', 'context', 'clear']);
+    expect(filterSlashCommands('web').map((c) => c.name)).toEqual(['web']);
+    expect(filterSlashCommands('zzz')).toEqual([]);                                 // no match → menu closes
+  });
+
+  it('every palette command is understood by the operator/local command layer', () => {
+    const local = new Set(['agents', 'enable', 'disable', 'clear', 'context', 'summarize']);
+    const mission = new Set(['plan', 'code', 'parallel']); // gate on isActionableCodingMission — need a real phrase
+    for (const cmd of SLASH_COMMANDS) {
+      if (local.has(cmd.name)) continue; // handled by tryLocalCommand/runSummary, not the operator parser
+      const sample = mission.has(cmd.name) ? `/${cmd.name} add request logging to the server`
+        : cmd.arg === 'required' ? `/${cmd.name} x` : `/${cmd.name}`;
+      expect(parseCockpitOperatorCommand(sample), `"${sample}" should parse`).toBeDefined();
+    }
   });
 });
