@@ -1,7 +1,27 @@
 import { selectAgents, defaultAgents } from '../agents/registry.js';
 import type { AgentDefinition, AgentAdapter } from '../agents/registry.js';
 import { checkMissionCompletion } from './mission-check.js';
+import { extractFirstJsonObject } from './review-verdict.js';
 import type { ValidationResult } from '../types.js';
+
+// Robustly pull the {satisfied, evidence, confidence} verdict from a checker agent's output, which
+// commonly wraps JSON in prose or code fences. Returns undefined if no parseable object is found, so
+// callers fall back to the deterministic check instead of silently relaxing the gate on a parse throw.
+function parseCheckerEvaluation(raw: string): { satisfied: boolean; evidence: string; confidence: number } | undefined {
+  const json = extractFirstJsonObject(raw);
+  if (!json) return undefined;
+  try {
+    const evaluation = JSON.parse(json) as Partial<{ satisfied: unknown; evidence: unknown; confidence: unknown }>;
+    const confidence = Number(evaluation.confidence);
+    return {
+      satisfied: Boolean(evaluation.satisfied),
+      evidence: typeof evaluation.evidence === 'string' && evaluation.evidence.trim() ? evaluation.evidence : 'No evidence provided',
+      confidence: Number.isFinite(confidence) ? Math.min(1, Math.max(0, confidence)) : 0.5,
+    };
+  } catch {
+    return undefined;
+  }
+}
 
 export interface GoalCondition {
   type: 'tests_pass' | 'lint_clean' | 'build_pass' | 'custom' | 'file_exists' | 'metric_threshold' | 'all_checks';
@@ -98,17 +118,8 @@ async function evaluateWithSeparateChecker(
     timeoutMs: 60_000,
   });
 
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
-    const evaluation = JSON.parse(result.stdout || result.stderr || '{}');
-    return {
-      satisfied: Boolean(evaluation.satisfied), // eslint-disable-line @typescript-eslint/no-unsafe-member-access
-      evidence: String(evaluation.evidence ?? 'No evidence provided'), // eslint-disable-line @typescript-eslint/no-unsafe-member-access
-      confidence: Number(evaluation.confidence ?? 0.5), // eslint-disable-line @typescript-eslint/no-unsafe-member-access
-    };
-  } catch {
-    return evaluateDeterministically(conditions, runArtifacts);
-  }
+  const evaluation = parseCheckerEvaluation(result.stdout || result.stderr || '');
+  return evaluation ?? evaluateDeterministically(conditions, runArtifacts);
 }
 
 function evaluateDeterministically(
@@ -242,22 +253,14 @@ export async function evaluateMissionCompletion(
     timeoutMs: 60_000,
   });
 
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
-    const evaluation = JSON.parse(result.stdout || result.stderr || '{}');
-    return {
-      satisfied: Boolean(evaluation.satisfied), // eslint-disable-line @typescript-eslint/no-unsafe-member-access
-      evidence: String(evaluation.evidence ?? 'No evidence provided'), // eslint-disable-line @typescript-eslint/no-unsafe-member-access
-      confidence: Number(evaluation.confidence ?? 0.5), // eslint-disable-line @typescript-eslint/no-unsafe-member-access
-    };
-  } catch {
-    const missionCheck = checkMissionCompletion(mission, diff);
-    return {
-      satisfied: missionCheck.status !== 'failed',
-      evidence: missionCheck.message,
-      confidence: 0.5,
-    };
-  }
+  const evaluation = parseCheckerEvaluation(result.stdout || result.stderr || '');
+  if (evaluation) return evaluation;
+  const missionCheck = checkMissionCompletion(mission, diff);
+  return {
+    satisfied: missionCheck.status !== 'failed',
+    evidence: missionCheck.message,
+    confidence: 0.5,
+  };
 }
 
 export { parseGoalCondition };

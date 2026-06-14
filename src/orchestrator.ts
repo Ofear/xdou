@@ -3,14 +3,15 @@ import fs from 'fs-extra';
 import { join } from 'node:path';
 import { ArtifactStore } from './core/artifact-store.js';
 import { compileContextPacket } from './core/context-compiler.js';
-import { applyPatch, createProjectSnapshot, createRunWorktree, currentHead, ensureCleanWorkingTree, ensureGitRepo, gitDiff, removeRunWorktree, repoSummary, reversePatch } from './core/repo.js';
+import { applyPatch, createProjectSnapshot, createRunWorktree, currentHead, ensureCleanWorkingTree, ensureGitRepo, gitDiff, isGitRepo, removeRunWorktree, repoSummary, reversePatch, withRepoLock } from './core/repo.js';
 import { checkMissionCompletion } from './core/mission-check.js';
 import { runGeneratedAcceptanceTests } from './core/acceptance-tests.js';
 import { extractReviewVerdict, reviewVerdictBlocks } from './core/review-verdict.js';
 import { runValidation } from './core/validation.js';
 import { appendCollaborationEvent, initializeCollaboration, publishLiveNote, readCollaborationState, recordPatchDeltas, sendAgentMessage } from './core/live-collaboration.js';
 import { defaultAgents, selectAgents } from './agents/registry.js';
-import type { AgentAdapter, AgentRunResult, ValidationResult } from './types.js';
+import { killInFlightAgents } from './agents/base.js';
+import type { AgentAdapter, AgentRunResult, RunManifest, ValidationResult } from './types.js';
 import type { ReviewVerdict } from './core/review-verdict.js';
 import type { AgentDefinition } from './agents/registry.js';
 
@@ -76,13 +77,37 @@ export class XdouOrchestrator {
   }
 
   async run(options: RunOptions): Promise<string> {
-    await ensureGitRepo(this.cwd);
-    if (options.execute !== false) await ensureCleanWorkingTree(this.cwd);
+    // In-place mode edits the working directory directly: no git/clean-tree requirement, so missions
+    // can act on uncommitted work or a non-git folder. Isolated mode keeps the safe worktree flow.
+    const inPlace = options.isolated === false;
+    if (!inPlace) {
+      await ensureGitRepo(this.cwd);
+      if (options.execute !== false) await ensureCleanWorkingTree(this.cwd);
+    }
     const run = await this.store.createRun(options.mission);
     const cleanupSignals = this.installAbortSignalHandlers(run.id);
+    try {
+      return await this.runPipeline(run, options, cleanupSignals);
+    } catch (error) {
+      // Never leave a run stuck in `running`: any unexpected failure marks it blocked so it can be
+      // inspected/discarded instead of looking active forever.
+      await this.store.updateManifest(run.id, { status: 'blocked', phase: 'failed' }).catch(() => { /* best-effort */ });
+      await this.store.appendEvent(run.id, { type: 'run.failed', by: 'xdou', error: error instanceof Error ? error.message : String(error) }).catch(() => { /* best-effort */ });
+      throw error;
+    } finally {
+      cleanupSignals();
+    }
+  }
+
+  private async runPipeline(run: RunManifest, options: RunOptions, cleanupSignals: () => void): Promise<string> {
+    const inPlace = options.isolated === false;
+    const isRepo = await isGitRepo(this.cwd);
+    // A diff is only meaningful with git; in-place/no-git runs apply changes live and report no patch.
+    const computeDiff = async (cwd: string): Promise<string> => (isRepo ? gitDiff(cwd) : '');
     await this.store.updateManifest(run.id, { status: 'running', phase: 'council', processPid: process.pid });
     const project = await repoSummary(this.cwd);
-    const snapshotCwd = await createProjectSnapshot(this.cwd, join(this.store.runDir(run.id), 'project-snapshot'));
+    // Council/planning agents read a snapshot in isolated git runs; in-place runs just read the cwd.
+    const snapshotCwd = inPlace || !isRepo ? this.cwd : await createProjectSnapshot(this.cwd, join(this.store.runDir(run.id), 'project-snapshot'));
     await this.store.writeText(run.id, 'project.md', project || 'No common project metadata found.');
     const selected = selectAgents(options.team ?? ['claude', 'codex', 'claude'], this.agents);
     const architect = selected[0];
@@ -131,10 +156,11 @@ export class XdouOrchestrator {
     await this.store.writeText(run.id, 'synthesis.md', synthesis);
     await this.store.writeJson(run.id, `agents/${architect.id}/plan-result.json`, planResult);
     await this.store.appendEvent(run.id, { type: 'plan.created', by: architect.id, ok: planResult.ok });
-    if (!planResult.ok) { await this.store.updateManifest(run.id, { status: 'blocked', phase: 'planning_failed' }); throw new Error(`Architect failed: ${planResult.stderr}`); }
+    // A clean exit with no plan text is a silent failure — don't feed an empty plan to the implementer.
+    if (!planResult.ok || !rawPlan.trim()) { await this.store.updateManifest(run.id, { status: 'blocked', phase: 'planning_failed' }); throw new Error(`Architect produced no usable plan: ${planResult.stderr || 'empty output'}`); }
     if (options.execute === false) { cleanupSignals(); await this.store.updateManifest(run.id, { status: 'completed', phase: 'planned' }); return run.id; }
 
-    const workspace = options.isolated === false ? { cwd: this.cwd } : await createRunWorktree(this.cwd, run.id);
+    const workspace = options.isolated === false ? { cwd: this.cwd } : await withRepoLock(this.store.root, () => createRunWorktree(this.cwd, run.id));
     await this.store.updateManifest(run.id, { phase: 'implementation', ...(workspace.worktreePath ? { worktreePath: workspace.worktreePath, baseRef: workspace.baseRef } : {}) });
     await publishLiveNote(this.store, run.id, implementer.id, 'implementer', {
       intent: 'Implement the canonical plan while exposing live direction and planned file touches for peer review.',
@@ -151,23 +177,24 @@ export class XdouOrchestrator {
     await this.store.writeJson(run.id, `agents/${implementer.id}/implementation-result.json`, implResult);
     await this.store.appendEvent(run.id, { type: 'implementation.finished', by: implementer.id, ok: implResult.ok });
 
-    let diff = await gitDiff(workspace.cwd);
+    let diff = await computeDiff(workspace.cwd);
     await this.store.writeText(run.id, 'diff.patch', diff || 'No diff produced.');
     await recordPatchDeltas(this.store, run.id, implementer.id, diff);
     await appendCollaborationEvent(this.store, run.id, { type: 'agent.round.finished', from: implementer.id, role: 'implementer', message: diff ? 'Implementation produced patch deltas for live peer review.' : 'Implementation finished without a diff.', severity: diff ? 'info' : 'warning' });
-    let validation = await this.validateWorkspace(run.id, options.mission, workspace.cwd, diff);
+    let validation = await this.validateWorkspace(run.id, options.mission, workspace.cwd, diff, isRepo);
     await this.store.appendEvent(run.id, { type: 'validation.finished', ok: !validation.some((v) => v.status === 'failed') });
 
     await this.store.updateManifest(run.id, { phase: 'review' });
-    const reviewSnapshotCwd = await createProjectSnapshot(workspace.cwd, join(this.store.runDir(run.id), 'review-snapshot'));
+    const reviewSnapshotCwd = (inPlace || !isRepo ? workspace.cwd : await createProjectSnapshot(workspace.cwd, join(this.store.runDir(run.id), "review-snapshot")));
     let reviewResults = await this.runReviews(run.id, reviewSnapshotCwd, options.mission, synthesis, diff, validation, reviewerNames, options.timeoutMs);
     let failed = this.hasBlockers(implResult, validation, reviewResults);
 
     const maxFixAttempts = options.maxFixAttempts ?? 1;
     const fixerName = options.fixer ?? implementer.id;
-    for (let attempt = 1; failed && attempt <= maxFixAttempts; attempt += 1) {
-      const [fixer] = selectAgents([fixerName], this.agents);
-      if (!fixer) break;
+    // Resolve the fixer once (selectAgents throws on unknown ids — never inside the loop).
+    const fixer = this.agents[fixerName];
+    if (failed && maxFixAttempts > 0 && !fixer) await this.store.appendEvent(run.id, { type: 'fix.skipped', by: 'xdou', reason: `unknown fixer "${fixerName}"` });
+    for (let attempt = 1; failed && fixer && attempt <= maxFixAttempts; attempt += 1) {
       await this.store.updateManifest(run.id, { phase: `fix_${attempt}`, fixAttempts: attempt });
       await this.store.appendEvent(run.id, { type: 'fix.started', by: fixer.id, attempt });
       const lastValidation = validation.at(-1);
@@ -187,20 +214,21 @@ export class XdouOrchestrator {
       const fixResult = await fixer.run(fixInput);
       await this.store.writeJson(run.id, `fixes/attempt-${attempt}/result.json`, fixResult);
       await this.store.appendEvent(run.id, { type: 'fix.finished', by: fixer.id, attempt, ok: fixResult.ok });
-      diff = await gitDiff(workspace.cwd);
+      diff = await computeDiff(workspace.cwd);
       await this.store.writeText(run.id, `fixes/attempt-${attempt}/diff.patch`, diff || 'No diff produced.');
       await this.store.writeText(run.id, 'diff.patch', diff || 'No diff produced.');
       await recordPatchDeltas(this.store, run.id, fixer.id, diff);
-      validation = await this.validateWorkspace(run.id, options.mission, workspace.cwd, diff);
+      validation = await this.validateWorkspace(run.id, options.mission, workspace.cwd, diff, isRepo);
       await this.store.writeJson(run.id, `fixes/attempt-${attempt}/validation.json`, validation);
       await this.store.appendEvent(run.id, { type: 'validation.finished', attempt, ok: !validation.some((v) => v.status === 'failed') });
-      const fixReviewSnapshotCwd = await createProjectSnapshot(workspace.cwd, join(this.store.runDir(run.id), `fixes/attempt-${attempt}/review-snapshot`));
+      const fixReviewSnapshotCwd = inPlace || !isRepo ? workspace.cwd : await createProjectSnapshot(workspace.cwd, join(this.store.runDir(run.id), `fixes/attempt-${attempt}/review-snapshot`));
       reviewResults = await this.runReviews(run.id, fixReviewSnapshotCwd, options.mission, synthesis, diff, validation, reviewerNames, options.timeoutMs);
       failed = this.hasBlockers(fixResult, validation, reviewResults);
     }
     if (failed && maxFixAttempts > 0) await this.store.appendEvent(run.id, { type: 'fix.exhausted', attempts: maxFixAttempts });
     await this.store.writeText(run.id, 'final-summary.md', this.formatFinalSummary(options.mission, run.id, synthesis, validation, reviewResults, failed, workspace.worktreePath));
-    const finalManifest = await this.store.updateManifest(run.id, { status: failed ? 'blocked' : 'completed', phase: failed ? 'needs_attention' : 'done' });
+    // In-place edits are already live in the working directory (nothing to /apply); record that.
+    const finalManifest = await this.store.updateManifest(run.id, { status: failed ? 'blocked' : 'completed', phase: failed ? 'needs_attention' : 'done', ...(inPlace ? { inPlace: true, appliedAt: new Date().toISOString() } : {}) });
     await this.store.writeJson(run.id, 'result.json', { runId: run.id, status: finalManifest.status, phase: finalManifest.phase, artifactDir: finalManifest.artifactDir, worktreePath: finalManifest.worktreePath, validation, reviews: reviewResults.map((review) => ({ agent: review.agent, ok: review.result.ok, verdict: review.verdict })) });
     cleanupSignals();
     if (failed) console.error(pc.yellow(`xdou run ${run.id} completed with blockers; inspect ${this.store.runDir(run.id)}`));
@@ -217,7 +245,9 @@ export class XdouOrchestrator {
     }
     const diffPath = join(this.store.runDir(runId), 'diff.patch');
     const diff = await fs.readFile(diffPath, 'utf8');
-    const applied = await applyPatch(this.cwd, diff);
+    const applied = await withRepoLock(this.store.root, () => applyPatch(this.cwd, diff));
+    // Snapshot the exact bytes applied so undo reverses precisely this, even if diff.patch changes later.
+    await this.store.writeText(runId, 'applied.patch', diff);
     const result = { runId, applied: true as const, filesChanged: applied.filesChanged, files: applied.files, artifactDir: manifest.artifactDir };
     await this.store.writeJson(runId, 'apply-result.json', result);
     await this.store.appendEvent(runId, { type: 'run.applied', by: 'xdou', filesChanged: applied.filesChanged });
@@ -229,9 +259,12 @@ export class XdouOrchestrator {
     await ensureGitRepo(this.cwd);
     const manifest = await this.store.readManifest(runId);
     if (!manifest.appliedAt) throw new Error(`Run ${runId} has not been applied; nothing to undo.`);
+    // Reverse the exact patch that was applied (snapshotted at apply time); fall back to diff.patch
+    // for runs applied before applied.patch existed.
+    const appliedPath = join(this.store.runDir(runId), 'applied.patch');
     const diffPath = join(this.store.runDir(runId), 'diff.patch');
-    const diff = await fs.readFile(diffPath, 'utf8');
-    const undone = await reversePatch(this.cwd, diff);
+    const diff = await fs.readFile(await fs.pathExists(appliedPath) ? appliedPath : diffPath, 'utf8');
+    const undone = await withRepoLock(this.store.root, () => reversePatch(this.cwd, diff));
     const result = { runId, undone: true as const, filesChanged: undone.filesChanged, files: undone.files, artifactDir: manifest.artifactDir };
     await this.store.writeJson(runId, 'undo-result.json', result);
     await this.store.appendEvent(runId, { type: 'run.undone', by: 'xdou', filesChanged: undone.filesChanged });
@@ -244,7 +277,7 @@ export class XdouOrchestrator {
   async discardRun(runId: string): Promise<{ runId: string; discarded: true; worktreePath?: string; artifactDir: string }> {
     await ensureGitRepo(this.cwd);
     const manifest = await this.store.readManifest(runId);
-    if (manifest.worktreePath) await removeRunWorktree(this.cwd, manifest.worktreePath);
+    if (manifest.worktreePath) await withRepoLock(this.store.root, () => removeRunWorktree(this.cwd, manifest.worktreePath as string));
     const result = { runId, discarded: true as const, ...(manifest.worktreePath ? { worktreePath: manifest.worktreePath } : {}), artifactDir: manifest.artifactDir };
     await this.store.writeJson(runId, 'discard-result.json', result);
     await this.store.appendEvent(runId, { type: 'run.discarded', by: 'xdou' });
@@ -276,7 +309,7 @@ export class XdouOrchestrator {
     const specs = [
       ...brainstormers.map((name) => ({ name, role: 'brainstormer' as const })),
       ...critics.map((name) => ({ name, role: 'critic' as const })),
-    ];
+    ].filter((spec, index, all) => all.findIndex((other) => other.name === spec.name && other.role === spec.role) === index);
     const outputs = await Promise.all(specs.map(async (spec): Promise<CouncilOutput | undefined> => {
       const [agent] = selectAgents([spec.name], this.agents);
       if (!agent) return undefined;
@@ -365,28 +398,21 @@ export class XdouOrchestrator {
     ].join('\n');
   }
 
-  private async validateWorkspace(runId: string, mission: string, cwd: string, diff: string): Promise<ValidationResult[]> {
+  private async validateWorkspace(runId: string, mission: string, cwd: string, diff: string, diffAvailable = true): Promise<ValidationResult[]> {
     const validation = await runValidation(cwd);
     const generatedAcceptance = await runGeneratedAcceptanceTests(cwd, mission);
     await this.store.writeJson(runId, 'generated-acceptance.json', generatedAcceptance);
     const missionCheck = checkMissionCompletion(mission, diff || 'No diff produced.');
     await this.store.writeJson(runId, 'mission-check.json', missionCheck);
-    const combined: ValidationResult[] = [
-      ...validation,
-      generatedAcceptance,
-      {
-        command: 'xdou diff-required-check',
-        status: diff.trim() ? 'passed' : 'failed',
-        output: diff.trim() ? 'Worktree diff produced.' : 'No worktree diff was produced; refusing to mark a mutating run completed because there is nothing to apply.',
-        exitCode: diff.trim() ? 0 : 1,
-      },
-      {
-        command: 'xdou mission-completion-check',
-        status: missionCheck.status === 'failed' ? 'failed' : 'passed',
-        output: missionCheck.message,
-        exitCode: missionCheck.status === 'failed' ? 1 : 0,
-      },
-    ];
+    // Without git there is no diff to inspect, so the diff-based gates can't run — skip them rather
+    // than fail an in-place run that legitimately edited files.
+    const diffRequired: ValidationResult = diffAvailable
+      ? { command: 'xdou diff-required-check', status: diff.trim() ? 'passed' : 'failed', output: diff.trim() ? 'Worktree diff produced.' : 'No worktree diff was produced; refusing to mark a mutating run completed because there is nothing to apply.', exitCode: diff.trim() ? 0 : 1 }
+      : { command: 'xdou diff-required-check', status: 'skipped', output: 'No git repo — changes applied in place; diff check skipped.', exitCode: 0 };
+    const missionCompletion: ValidationResult = diffAvailable
+      ? { command: 'xdou mission-completion-check', status: missionCheck.status === 'failed' ? 'failed' : 'passed', output: missionCheck.message, exitCode: missionCheck.status === 'failed' ? 1 : 0 }
+      : { command: 'xdou mission-completion-check', status: 'skipped', output: 'No git diff to verify mission symbols against (in-place run).', exitCode: 0 };
+    const combined: ValidationResult[] = [...validation, generatedAcceptance, diffRequired, missionCompletion];
     await this.store.writeJson(runId, 'validation.json', combined);
     return combined;
   }
@@ -401,11 +427,14 @@ export class XdouOrchestrator {
   }
 
   private hasBlockers(lastMutation: AgentRunResult, validation: ValidationResult[], reviews: ReviewOutput[]): boolean {
-    return !lastMutation.ok || validation.some((v) => v.status === 'failed') || reviews.some((review) => !review.result.ok || reviewVerdictBlocks(review.verdict));
+    // The parsed verdict is authoritative: a crashed/empty reviewer already maps to a `blocked`
+    // verdict, so a noisy non-zero exit alongside a valid `approve` must not discard the green review.
+    return !lastMutation.ok || validation.some((v) => v.status === 'failed') || reviews.some((review) => reviewVerdictBlocks(review.verdict));
   }
 
   private installAbortSignalHandlers(runId: string): () => void {
     const handle = (signal: NodeJS.Signals): void => {
+      killInFlightAgents(); // terminate running agent CLIs before exiting so none are orphaned
       void this.store.abortRun(runId, `received ${signal}`).finally(() => process.exit(130));
     };
     process.once('SIGINT', handle);

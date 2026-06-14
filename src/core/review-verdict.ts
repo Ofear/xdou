@@ -62,7 +62,7 @@ function normalizeAgentOutput(output: string): string {
   return output;
 }
 
-function extractFirstJsonObject(text: string): string | undefined {
+export function extractFirstJsonObject(text: string): string | undefined {
   const start = text.indexOf('{');
   if (start < 0) return undefined;
   let depth = 0;

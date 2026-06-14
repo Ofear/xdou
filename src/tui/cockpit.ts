@@ -4,7 +4,13 @@ import { matchesKey, truncateToWidth, visibleWidth } from '@earendil-works/pi-tu
 import stripAnsi from 'strip-ansi';
 import type { ArtifactStore } from '../core/artifact-store.js';
 import { readCollaborationState, type CollaborationEvent, type CollaborationState } from '../core/live-collaboration.js';
+import { CONTEXT_CHAR_BUDGET, turnChars } from '../core/assistant-prompt.js';
 import type { RunManifest } from '../types.js';
+
+// Verbatim conversation past this many characters triggers an automatic summary fold-in before the
+// next chat call. Kept below CONTEXT_CHAR_BUDGET so older turns get summarized (not silently dropped
+// by the cap) once a session grows long.
+const AUTO_SUMMARIZE_CHARS = 6000;
 
 interface TimelineEvent {
   time: string | undefined;
@@ -61,10 +67,6 @@ export type CockpitOperatorCommand =
   | { action: 'parallel'; mission: string }
   | { action: 'diff' | 'review' | 'status' | 'apply' | 'test' | 'fix' | 'discard' | 'undo'; runId?: string };
 
-export type CockpitLaunchResult =
-  | { kind: 'exit' }
-  | { kind: 'mission'; command: 'plan' | 'run'; mission: string }
-  | { kind: 'operator'; command: CockpitOperatorCommand };
 
 const missionActionVerbs = new Set([
   'add', 'build', 'create', 'make', 'implement', 'fix', 'debug', 'refactor', 'update', 'change', 'improve', 'write', 'generate', 'design', 'plan', 'run', 'code', 'test',
@@ -103,9 +105,33 @@ export function parseCockpitMissionCommand(input: string): CockpitMissionCommand
   return isActionableCodingMission(trimmed) ? { action: 'run', mission: trimmed } : undefined;
 }
 
+// Natural-language web-search intent, e.g. "search the web for X", "look up X online", "google X".
+// Deliberately strict: a bare "web"/"internet" used as an adjective ("search web component") is a
+// FILE search, not web research. Requires a real signal: "the web/internet", "online", or "google".
+function detectWebIntent(text: string): boolean {
+  const t = text.toLowerCase();
+  if (/^\s*google\s+\S/i.test(text)) return true;                                   // "google X"
+  if (/\bthe\s+(web|internet)\b/.test(t)) return true;                              // "search/on the web/internet"
+  if (/\bonline\b/.test(t) && /\b(search|look\s?up|find|browse|fetch|check)\b/.test(t)) return true; // "... online"
+  if (/\b(search|browse|look\s?up)\s+(the\s+net|google)\b/.test(t)) return true;
+  return false;
+}
+
+// Strip the "search the web for …" framing so the web query is just the subject.
+function webQuery(text: string): string {
+  const cleaned = text.trim()
+    .replace(/^[:/]/, '')
+    .replace(/^\s*(please\s+)?(google|search|look\s?up|browse|fetch|check)\s+/i, '')
+    .replace(/^\s*(on\s+)?(the\s+)?(web|internet|online)\s*/i, '')
+    .replace(/^\s*(for|about|on)\s+/i, '')
+    .trim();
+  return cleaned || text.trim();
+}
+
 export function parseCockpitOperatorCommand(input: string): CockpitOperatorCommand | undefined {
   const trimmed = input.trim();
   if (!trimmed) return undefined;
+  const explicit = /^[:/]/.test(trimmed);
   const normalized = trimmed.replace(/^[:/]/, '');
   const [rawVerb, ...rest] = normalized.split(/\s+/);
   const verb = rawVerb?.toLowerCase();
@@ -113,7 +139,9 @@ export function parseCockpitOperatorCommand(input: string): CockpitOperatorComma
   if (!verb) return undefined;
   if (['ask', 'question', 'q'].includes(verb)) return body ? { action: 'ask', prompt: body } : undefined;
   if (['web', 'search-web'].includes(verb)) return body ? { action: 'web', query: body } : undefined;
-  if (['find', 'file', 'search'].includes(verb)) return body ? { action: 'find', query: body } : undefined;
+  if (['find', 'file'].includes(verb)) return body ? { action: 'find', query: body } : undefined;
+  // "search …" is web when it mentions the web/internet, otherwise a file search.
+  if (verb === 'search') return detectWebIntent(trimmed) ? { action: 'web', query: webQuery(trimmed) } : (body ? { action: 'find', query: body } : undefined);
   if (verb === 'continue') return { action: 'continue' };
   if (['diff', 'changes', 'v'].includes(verb)) return body ? { action: 'diff', runId: body } : { action: 'diff' };
   if (['review', 'r'].includes(verb)) return body ? { action: 'review', runId: body } : { action: 'review' };
@@ -125,6 +153,8 @@ export function parseCockpitOperatorCommand(input: string): CockpitOperatorComma
   if (['undo', 'rollback', 'u'].includes(verb)) return body ? { action: 'undo', runId: body } : { action: 'undo' };
   if (['parallel', 'fork'].includes(verb)) return body ? { action: 'parallel', mission: body } : undefined;
   if (['plan', 'p', 'run', 'code', 'c'].includes(verb)) return parseCockpitMissionCommand(trimmed);
+  // Natural language (no slash command): infer web-search intent before falling back to chat/mission.
+  if (!explicit && detectWebIntent(trimmed)) return { action: 'web', query: webQuery(trimmed) };
   if (trimmed.endsWith('?')) return { action: 'ask', prompt: trimmed };
   if (!isActionableCodingMission(trimmed)) return { action: 'ask', prompt: trimmed };
   return parseCockpitMissionCommand(trimmed);
@@ -139,9 +169,13 @@ const reset = '\x1b[0m';
 const sgr = (code: number, value: string): string => `\x1b[${code}m${value}${reset}`;
 const bold = (value: string): string => sgr(1, value);
 const dim = (value: string): string => sgr(2, value);
+const inverse = (value: string): string => `\x1b[7m${value}\x1b[27m`;
+const italic = (value: string): string => `\x1b[3m${value}\x1b[23m`;
+const underline = (value: string): string => `\x1b[4m${value}\x1b[24m`;
 const red = (value: string): string => sgr(31, value);
 const green = (value: string): string => sgr(32, value);
 const yellow = (value: string): string => sgr(33, value);
+const blue = (value: string): string => sgr(34, value);
 const magenta = (value: string): string => sgr(35, value);
 const cyan = (value: string): string => sgr(36, value);
 
@@ -396,14 +430,16 @@ function decisionSummaryLines(state: CockpitState): string[] {
 
 // ─── Layout Helpers ───
 
-function threeColumn(left: string[], mid: string[], right: string[], leftW: number, midW: number, gap = 2): string[] {
+function threeColumn(left: string[], mid: string[], right: string[], leftW: number, midW: number, rightW: number, gap = 2): string[] {
   const height = Math.max(left.length, mid.length, right.length);
   const out: string[] = [];
   for (let i = 0; i < height; i++) {
     const l = left[i] ?? '';
     const m = mid[i] ?? '';
     const r = right[i] ?? '';
-    out.push(pad(l, leftW) + ' '.repeat(gap) + pad(m, midW) + ' '.repeat(gap) + r);
+    // Truncate the right column too — leaving it raw lets long artifact/timeline lines
+    // overflow past the layout width and wrap, which scrolls the TUI and duplicates frames.
+    out.push(pad(l, leftW) + ' '.repeat(gap) + pad(m, midW) + ' '.repeat(gap) + truncate(r, rightW));
   }
   return out;
 }
@@ -434,7 +470,7 @@ function renderEmptyMissionHeader(width: number): string[] {
   const contentWidth = width - 4;
   return [
     `┌${'─'.repeat(contentWidth)}┐`,
-    pad('  Waiting for operator prompt...', contentWidth),
+    pad(`  ${bold('No active mission')} ${dim('· chatting — start one with /code <idea> or /plan <idea>')}`, contentWidth),
     `└${'─'.repeat(contentWidth)}┘`,
     '',
   ];
@@ -446,6 +482,20 @@ function renderAgentsColumn(agents: AgentCard[], width: number, height: number):
     const statusDisp = agentStatusDisplay(agent.status);
     lines.push(`${statusDisp.icon} ${statusDisp.color(agent.id)}  ${dim(agent.role)}`);
     lines.push(`  ${dim(agent.last)}`);
+    lines.push('');
+  }
+  while (lines.length < height) lines.push('');
+  return lines.slice(0, height);
+}
+
+// The toggleable roster: each agent shows a checkbox reflecting whether it participates in runs.
+function renderRosterColumn(roster: CockpitRosterAgent[], disabled: Set<string>, height: number): string[] {
+  const lines: string[] = [`${bold('AGENTS')}  ${dim('/enable /disable')}`];
+  for (const agent of roster) {
+    const off = disabled.has(agent.id);
+    const box = off ? dim('[ ]') : green('[x]');
+    const name = off ? dim(agent.id) : authorStyle(agent.id)(agent.id);
+    lines.push(`${box} ${name}  ${dim(agent.roles.join(', ') || 'agent')}`);
     lines.push('');
   }
   while (lines.length < height) lines.push('');
@@ -482,7 +532,7 @@ function renderArtifactsColumn(state: CockpitState, width: number, height: numbe
     const applied = state.selected.appliedAt ? green('[Applied]') : '';
     lines.push(`  ${dim('Gate:')}${state.selected.status === 'completed' ? ' ' + green('Ready to apply') : ' ' + dim('waiting')} ${applied}`);
   } else {
-    lines.push(`  ${dim('Gate:')} waiting for operator prompt`);
+    lines.push(`  ${dim('Gate:')} ${dim('no mission yet — /code or /plan to start')}`);
   }
   while (lines.length < height) lines.push('');
   return lines.slice(0, height);
@@ -490,51 +540,78 @@ function renderArtifactsColumn(state: CockpitState, width: number, height: numbe
 
 function renderActionsFooter(state: CockpitState, width: number): string[] {
   const selected = state.selected;
-  let actions: string[] = [];
+  let actions: string;
 
   if (!selected) {
-    actions = [
-      '[1] /ask Question    [2] /find File    [3] /web Search    [4] /plan Mission    [5] /code Mission    [6] Quit',
-    ];
+    actions = '/ask <q>   /find <file>   /web <topic>   /plan <idea>   /code <idea>   ·   Ctrl+C quits';
   } else if (selected.status === 'completed' && !selected.appliedAt) {
-    actions = [
-      '[1] Review diff (v)  [2] Run tests (t)  [3] Apply (a)  [4] Ask agent (q)  [5] New mission  [q] Quit',
-    ];
+    actions = '/diff view changes   /test run tests   /apply   /ask <q>   /code <new mission>   ·   Ctrl+C quits';
   } else if (selected.status === 'blocked') {
-    actions = [
-      '[1] Fix (f)  [2] Discard (d)  [3] Review diff (v)  [4] Ask agent (q)  [q] Quit',
-    ];
+    actions = '/fix blockers   /discard   /diff view changes   /ask <q>   ·   Ctrl+C quits';
   } else if (selected.status === 'running') {
-    actions = [
-      '[r] Refresh  [v] View diff  [q] Quit',
-    ];
+    actions = '/status refresh   /diff view changes   ·   Ctrl+C quits';
   } else if (selected.appliedAt) {
-    actions = [
-      '[1] Undo (u)  [2] Continue (c)  [3] Review diff (v)  [q] Quit',
-    ];
+    actions = '/undo   /continue   /diff view changes   ·   Ctrl+C quits';
   } else {
-    actions = [
-      '[1] /plan Mission  [2] /code Mission  [3] /ask Question  [q] Quit',
-    ];
+    actions = '/plan <idea>   /code <idea>   /ask <q>   ·   Ctrl+C quits';
   }
 
   const contentWidth = width - 4;
   return [
     '',
     `┌${'─'.repeat(contentWidth)}┐`,
-    pad(`  ${actions[0]}`, contentWidth),
+    pad(`  ${actions}`, contentWidth),
     `└${'─'.repeat(contentWidth)}┘`,
   ];
 }
 
-function renderPromptComposer(width: number, activePrompt: string, promptError?: string, footerMessage?: string): string[] {
+// Hard-wrap `label + prompt` (honouring explicit \n line breaks) to `width` cells per row and draw
+// a reverse-video block cursor at `cursor` (an index into `prompt`). Never truncates the operator's
+// own input — long lines wrap to more rows instead.
+function editableRows(label: string, prompt: string, width: number, cursor: number): string[] {
+  const full = label + prompt;
+  const cursorAbs = label.length + cursor;
+  const rows: Array<{ start: number; text: string }> = [];
+  let pos = 0;
+  const segments = full.split('\n');
+  segments.forEach((seg, si) => {
+    if (seg.length === 0) {
+      rows.push({ start: pos, text: '' });
+    } else {
+      for (let s = 0; s < seg.length; s += width) rows.push({ start: pos + s, text: seg.slice(s, s + width) });
+    }
+    pos += seg.length + (si < segments.length - 1 ? 1 : 0); // count the '\n' between segments
+  });
+  if (!rows.length) rows.push({ start: 0, text: '' });
+
+  return rows.map((row) => {
+    const end = row.start + row.text.length;
+    if (cursorAbs >= row.start && cursorAbs < end) {
+      const col = cursorAbs - row.start;
+      return row.text.slice(0, col) + inverse(row.text[col] ?? ' ') + row.text.slice(col + 1);
+    }
+    // Cursor at end of input, or at the end of a logical line (sitting on the newline): show it here.
+    if (cursorAbs === end && (cursorAbs === full.length || full[cursorAbs] === '\n')) {
+      return `${row.text}${inverse(' ')}`;
+    }
+    return row.text;
+  });
+}
+
+function renderPromptComposer(width: number, activePrompt: string, promptError?: string, footerMessage?: string, cursor?: number): string[] {
   const contentWidth = width - 4;
-  const lines: string[] = [
-    `┌${'─'.repeat(contentWidth)}┐`,
-    pad(`  ${activePrompt ? `Prompt: ${activePrompt}█` : 'Prompt: /ask question | /find file | /web topic | /plan <idea> | /code <idea>'}`, contentWidth),
-    pad(`  /ask /find /web do not require Git. /code and /run will initialize Git in a project folder.`, contentWidth),
-    `└${'─'.repeat(contentWidth)}┘`,
-  ];
+  const innerWidth = Math.max(8, contentWidth - 2); // leading "  " indent
+  const lines: string[] = [`┌${'─'.repeat(contentWidth)}┐`];
+  if (activePrompt) {
+    const cur = cursor === undefined ? activePrompt.length : Math.max(0, Math.min(cursor, activePrompt.length));
+    // Leave one cell for a trailing cursor block so it never overflows the box.
+    for (const row of editableRows('Prompt: ', activePrompt, innerWidth - 1, cur)) lines.push(pad(`  ${row}`, contentWidth));
+  } else {
+    lines.push(pad('  Prompt: /ask question | /find file | /web topic | /plan <idea> | /code <idea>', contentWidth));
+    lines.push(pad('  Tip: \\ then Enter = new line · ←/→/↑/↓ Home/End move · Enter sends', contentWidth));
+  }
+  lines.push(pad('  /ask /find /web do not require Git. /code and /run will initialize Git in a project folder.', contentWidth));
+  lines.push(`└${'─'.repeat(contentWidth)}┘`);
   if (promptError) lines.push(red(`  ${promptError}`));
   if (footerMessage) lines.push(dim(`  ${footerMessage}`));
   return lines;
@@ -559,7 +636,7 @@ function emptyCockpitLines(width: number, activePrompt = ''): string[] {
       renderAgentsColumn(agents, leftW, colHeight),
       renderTimelineColumn({ runs: [], selected: undefined, timeline: [], verdicts: [], artifacts: { plan: [], diff: [], review: [], summary: [] } }, midW, colHeight),
       renderArtifactsColumn({ runs: [], selected: undefined, timeline: [], verdicts: [], artifacts: { plan: [], diff: [], review: [], summary: [] } }, rightW, colHeight),
-      leftW, midW
+      leftW, midW, rightW
     ),
     ...renderActionsFooter({ runs: [], selected: undefined, timeline: [], verdicts: [], artifacts: { plan: [], diff: [], review: [], summary: [] } }, width),
     ...renderPromptComposer(width, activePrompt),
@@ -588,7 +665,7 @@ export function renderCockpitSnapshot(state: CockpitState, width = 120, activePr
     renderAgentsColumn(agents, leftW, colHeight),
     renderTimelineColumn(state, midW, colHeight),
     renderArtifactsColumn(state, rightW, colHeight),
-    leftW, midW
+    leftW, midW, rightW
   ));
 
   // Decision summary (compact)
@@ -606,20 +683,298 @@ export function renderCockpitSnapshot(state: CockpitState, width = 120, activePr
 
 // ─── Interactive VisualCockpit ───
 
+export interface ConversationEntry {
+  author: string;   // 'you', 'claude', 'codex', 'xdou', 'system', …
+  text: string;
+  mine?: boolean;   // true for lines the operator typed
+}
+
+export interface CockpitCommandResult {
+  output: string;
+  author: string;   // who produced the output, for per-author coloring in the OUTPUT panel
+  state: CockpitState;
+}
+
+// One roster agent shown in (and toggled from) the AGENTS panel.
+export interface CockpitRosterAgent { id: string; roles: string[] }
+
+export interface CockpitController {
+  // Run a quick/conversational command without leaving the dashboard. The returned text is shown
+  // in the OUTPUT panel and the returned state refreshes the dashboard in place. `history` (recent
+  // verbatim turns) + `summary` (compacted older turns) give the assistant bounded session context.
+  runInline(command: CockpitOperatorCommand, opts: { history: ConversationEntry[]; summary: string }): Promise<CockpitCommandResult>;
+  // Run a long mission/fix that needs the full terminal (streams output, may prompt the operator).
+  // The cockpit leaves the alternate screen before calling this and re-enters afterwards.
+  // `disabledAgents` are excluded from the multi-agent team for this run.
+  runSuspended(command: CockpitOperatorCommand, opts: { disabledAgents: string[] }): Promise<CockpitCommandResult>;
+  // Compress the conversation into a compact summary (context compaction).
+  summarize(opts: { priorSummary: string; turns: ConversationEntry[] }): Promise<{ summary: string }>;
+}
+
+export interface CockpitPersistSnapshot {
+  entries: ConversationEntry[];
+  summary: string;
+  summarizedCount: number;
+}
+
+export interface CockpitLaunchOptions {
+  sessionId?: string;
+  history?: ConversationEntry[];
+  summary?: string;
+  summarizedCount?: number;
+  onPersist?: (snapshot: CockpitPersistSnapshot) => void; // persist after each conversation change
+  roster?: CockpitRosterAgent[];                          // agents that can be toggled on/off
+}
+
+// Distinct, stable color per author so it's obvious at a glance who wrote what in the OUTPUT panel.
+function authorStyle(author: string): (s: string) => string {
+  const a = author.toLowerCase();
+  if (a === 'you' || a === 'human' || a === 'operator') return cyan;
+  if (a.includes('claude')) return magenta;
+  if (a.includes('codex')) return green;
+  if (a.includes('gpt') || a.includes('openai') || a.includes('openrouter') || a.includes('opencode')) return yellow;
+  if (a === 'system' || a.includes('xdou')) return blue;
+  return bold;
+}
+
+function commandSuspends(command: CockpitOperatorCommand): boolean {
+  return command.action === 'plan' || command.action === 'run' || command.action === 'fix' || command.action === 'parallel';
+}
+
+// True when the operator explicitly asked for a mission (typed /plan, /run, /code, …). Plain prose
+// that merely *looks* like a mission is not explicit, so we confirm before launching agents.
+function isExplicitMissionCommand(input: string): boolean {
+  const verb = input.trim().replace(/^[:/]/, '').split(/\s+/)[0]?.toLowerCase();
+  return ['plan', 'p', 'run', 'code', 'c', 'parallel', 'fork'].includes(verb ?? '');
+}
+
+function describeCommand(command: CockpitOperatorCommand): string {
+  if (command.action === 'plan') return `plan: ${command.mission}`;
+  if (command.action === 'run') return `mission: ${command.mission}`;
+  if (command.action === 'parallel') return `parallel: ${command.mission}`;
+  return command.action;
+}
+
+// Word-wrap plain (ANSI-free) conversation text to a column width so the OUTPUT panel never
+// emits a line wider than its box — which would wrap and scroll the whole TUI.
+function wrapPlain(text: string, width: number): string[] {
+  if (width <= 1) return text.split(/\r?\n/);
+  const out: string[] = [];
+  for (const rawLine of text.split(/\r?\n/)) {
+    let line = rawLine;
+    if (line === '') { out.push(''); continue; }
+    // Measure by visible width and break on code-point boundaries so wide chars (CJK) and emoji
+    // (surrogate pairs) don't overflow the column or get split mid-character.
+    while (visibleWidth(line) > width) {
+      const chars = [...line];
+      let acc = '';
+      for (const ch of chars) {
+        if (visibleWidth(acc + ch) > width) break;
+        acc += ch;
+      }
+      if (!acc) acc = chars[0] ?? line; // never make zero progress
+      const lastSpace = acc.lastIndexOf(' ');
+      if (lastSpace > Math.floor(acc.length * 0.5)) {
+        out.push(acc.slice(0, lastSpace));
+        line = line.slice(lastSpace + 1);
+      } else {
+        out.push(acc);
+        line = line.slice(acc.length);
+      }
+    }
+    out.push(line);
+  }
+  return out;
+}
+
+// Apply inline Markdown styling to a single (already width-wrapped) line.
+function styleMarkdownInline(line: string): string {
+  return line
+    .replace(/\*\*([^*]+)\*\*/g, (_, t: string) => bold(t))
+    .replace(/__([^_]+)__/g, (_, t: string) => bold(t))
+    .replace(/`([^`]+)`/g, (_, t: string) => yellow(t))
+    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_, t: string, u: string) => `${underline(t)} ${dim(`(${u})`)}`)
+    .replace(/(^|[^*])\*([^*\s][^*]*)\*(?!\*)/g, (_, pre: string, t: string) => `${pre}${italic(t)}`);
+}
+
+// Render Markdown to width-wrapped, ANSI-styled lines for the OUTPUT panel. Block markers (headings,
+// bullets, quotes, fenced code) are handled per line; inline markers are applied after wrapping so a
+// long line never overflows the panel width.
+export function renderMarkdownLines(text: string, width: number): string[] {
+  const out: string[] = [];
+  let inCode = false;
+  for (const raw of text.split(/\r?\n/)) {
+    if (/^\s*```/.test(raw)) { inCode = !inCode; continue; } // skip fence markers
+    if (inCode) { for (const l of wrapPlain(raw, width)) out.push(green(l)); continue; }
+    const heading = raw.match(/^\s*(#{1,6})\s+(.*)$/);
+    const bullet = raw.match(/^\s*[-*+]\s+(.*)$/);
+    const numbered = raw.match(/^\s*(\d+)\.\s+(.*)$/);
+    const quote = raw.match(/^\s*>\s?(.*)$/);
+    let bodyText = raw;
+    let prefix = '';
+    let wrap: (s: string) => string = (s) => s;
+    if (heading) { bodyText = heading[2] ?? ''; wrap = (s) => bold(cyan(s)); }
+    else if (bullet) { bodyText = bullet[1] ?? ''; prefix = '• '; }
+    else if (numbered) { bodyText = numbered[2] ?? ''; prefix = `${numbered[1]}. `; }
+    else if (quote) { bodyText = quote[1] ?? ''; wrap = (s) => dim(s); }
+    const wrapped = wrapPlain(prefix + bodyText, width);
+    if (!wrapped.length) out.push('');
+    for (const w of wrapped) out.push(wrap(styleMarkdownInline(w)));
+  }
+  return out;
+}
+
+function renderOutputPanel(entries: ConversationEntry[], width: number, height: number, scroll: number, busyLabel: string): string[] {
+  const contentWidth = width - 4;
+  const innerWidth = Math.max(8, contentWidth - 2);
+  const bodyH = Math.max(1, height - 2);
+
+  const display: string[] = [];
+  for (const entry of entries) {
+    const color = entry.mine ? cyan : authorStyle(entry.author);
+    const isSystem = !entry.mine && entry.author === 'system';
+    // xdou tool output (diff/status/find/…) is preformatted — Markdown rendering would mangle a patch
+    // (turning `-`/`#` lines into bullets/headings). Only real agent chat replies are Markdown.
+    const isTool = !entry.mine && entry.author === 'xdou';
+    // Colored author label + a colored gutter bar down the message so each speaker is scannable.
+    display.push(`  ${color(bold(entry.mine ? `› ${entry.author}` : entry.author))}`);
+    const bodyLines = entry.mine || isSystem || isTool
+      ? wrapPlain(entry.text, innerWidth - 2).map((l) => (isSystem ? dim(l) : l))
+      : renderMarkdownLines(entry.text, innerWidth - 2);
+    for (const l of bodyLines) display.push(`  ${color('│')} ${l}`);
+    display.push('');
+  }
+  if (busyLabel) display.push(`  ${yellow(busyLabel)}`);
+  if (!display.length) display.push(`  ${dim('Type a prompt below — replies appear here.')}`);
+
+  const total = display.length;
+  const maxScroll = Math.max(0, total - bodyH);
+  const clamped = Math.min(Math.max(0, scroll), maxScroll);
+  const start = Math.max(0, total - bodyH - clamped);
+  const windowLines = display.slice(start, start + bodyH);
+  while (windowLines.length < bodyH) windowLines.push('');
+
+  const title = busyLabel
+    ? ` OUTPUT · ${busyLabel} `
+    : maxScroll > 0 ? ` OUTPUT · ↑↓/PgUp/PgDn (${maxScroll - clamped} above) ` : ' OUTPUT ';
+  const fill = Math.max(0, contentWidth - 1 - visibleWidth(title));
+  return [
+    `┌─${title}${'─'.repeat(fill)}┐`,
+    ...windowLines.map((l) => pad(l, contentWidth)),
+    `└${'─'.repeat(contentWidth)}┘`,
+  ];
+}
+
+// Split one stdin read into individual key tokens. A single read can carry several keypresses —
+// most commonly when an arrow key autorepeats (held down) and the terminal coalesces the escape
+// sequences into one chunk. Each escape sequence (\x1b[… / \x1bO…) becomes its own token; runs of
+// non-escape bytes (typed text) stay together.
+function splitKeyTokens(data: string): string[] {
+  const tokens: string[] = [];
+  let i = 0;
+  while (i < data.length) {
+    if (data[i] === '\x1b') {
+      let j = i + 1;
+      if (data[j] === '[' || data[j] === 'O') {
+        j += 1;
+        while (j < data.length && !/[A-Za-z~]/.test(data[j] ?? '')) j += 1;
+        j += 1; // include the final byte of the sequence
+      }
+      tokens.push(data.slice(i, j));
+      i = j;
+    } else {
+      let j = i;
+      while (j < data.length && data[j] !== '\x1b') j += 1;
+      tokens.push(data.slice(i, j));
+      i = j;
+    }
+  }
+  return tokens.length ? tokens : [data];
+}
+
 class VisualCockpit {
-  private focus = 1;
-  private promptMode = false;
   private prompt = '';
+  private cursor = 0; // insertion point within `prompt`
   private promptError = '';
   private footerMessage = '';
-  private result: CockpitLaunchResult = { kind: 'exit' };
+  private busy = false;
+  private busyStart = 0;
+  private spinnerTick = 0;
+  private spinnerTimer: ReturnType<typeof setInterval> | undefined;
+  private scroll = 0;
+  private done = false;
+  private suspended = false; // alt screen dropped for a streaming mission — never paint over it
+  private pendingMission: { command: CockpitOperatorCommand; text: string } | undefined; // awaiting y/N confirmation
+  private state: CockpitState;
+  private readonly conversation: ConversationEntry[];
+  private summary: string;            // rolling summary of older turns
+  private summarizedCount: number;    // leading entries folded into `summary`
+  private readonly disabledAgents = new Set<string>(); // roster agents the operator has turned off
+  private readonly roster: CockpitRosterAgent[];
+  private readonly sessionId: string | undefined;
+  private readonly onPersist: ((snapshot: CockpitPersistSnapshot) => void) | undefined;
   private readonly stdin = process.stdin;
   private readonly stdout = process.stdout;
-  private readonly inputHandler = (data: string): void => this.handleInput(data);
+  private readonly inputHandler = (data: string): void => { void this.handleInput(data); };
   private readonly resizeHandler = (): void => this.renderToTerminal();
   private wasRaw = false;
 
-  constructor(private readonly state: CockpitState, private readonly onExit: (result: CockpitLaunchResult) => void) {}
+  constructor(initialState: CockpitState, private readonly controller: CockpitController, private readonly onExit: () => void, options: CockpitLaunchOptions = {}) {
+    this.state = initialState;
+    this.conversation = options.history ? [...options.history] : [];
+    this.summary = options.summary ?? '';
+    this.summarizedCount = Math.min(options.summarizedCount ?? 0, this.conversation.length);
+    // Invariant: a non-empty summary must cover some history. If a stale/odd session has a summary
+    // with summarizedCount 0, treat the loaded history as already covered so it isn't double-sent.
+    if (this.summary && this.summarizedCount === 0) this.summarizedCount = this.conversation.length;
+    this.roster = options.roster ?? [];
+    this.sessionId = options.sessionId;
+    this.onPersist = options.onPersist;
+  }
+
+  private persist(): void {
+    this.onPersist?.({ entries: this.conversation, summary: this.summary, summarizedCount: this.summarizedCount });
+  }
+
+  // An animated spinner with an elapsed-seconds counter, re-rendered on a timer so a long agent call
+  // visibly progresses instead of looking frozen. Only used for in-cockpit (non-suspended) work.
+  private startSpinner(): void {
+    this.busy = true;
+    this.busyStart = Date.now();
+    this.spinnerTick = 0;
+    if (this.spinnerTimer) clearInterval(this.spinnerTimer);
+    this.spinnerTimer = setInterval(() => { this.spinnerTick += 1; this.renderToTerminal(); }, 250);
+    this.renderToTerminal();
+  }
+
+  private stopSpinner(): void {
+    this.busy = false;
+    if (this.spinnerTimer) { clearInterval(this.spinnerTimer); this.spinnerTimer = undefined; }
+  }
+
+  private busyLabel(): string {
+    if (!this.busy) return '';
+    const frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+    const elapsed = this.busyStart ? Math.floor((Date.now() - this.busyStart) / 1000) : 0;
+    return `${frames[this.spinnerTick % frames.length] ?? '⠿'} working… ${elapsed}s`;
+  }
+
+  // Append a conversation entry and persist the session (for resume).
+  private push(entry: ConversationEntry): void {
+    this.conversation.push(entry);
+    this.persist();
+  }
+
+  // Verbatim turns not yet folded into the summary (excluding the just-typed current line at index -1).
+  private contextTurns(): ConversationEntry[] {
+    return this.conversation.slice(this.summarizedCount, Math.max(this.summarizedCount, this.conversation.length - 1));
+  }
+
+  private contextChars(): number {
+    // Use the same per-turn sizing as capHistory so auto-summarize triggers before the cap would
+    // silently drop the oldest turns.
+    return turnChars(this.contextTurns());
+  }
 
   start(): void {
     this.wasRaw = Boolean(this.stdin.isRaw);
@@ -628,131 +983,346 @@ class VisualCockpit {
     this.stdin.resume();
     this.stdin.on('data', this.inputHandler);
     this.stdout.on('resize', this.resizeHandler);
-    // Enter alternate screen buffer
+    // Enter alternate screen buffer + hide cursor
     this.stdout.write('\x1b[?1049h\x1b[?25l');
     this.renderToTerminal();
   }
 
-  private handleInput(data: string): void {
-    const chunk = parseCockpitInputChunk(data);
-    if (matchesKey(chunk, 'q') && !this.promptMode) { this.shutdown(); return; }
-    if (matchesKey(chunk, 'escape') || matchesKey(chunk, 'ctrl+c')) { this.promptMode = false; this.prompt = ''; this.promptError = ''; this.renderToTerminal(); return; }
-    if (matchesKey(chunk, 'tab')) { this.focus = (this.focus + 1) % 3; this.renderToTerminal(); return; }
-
-    if (!this.promptMode) {
-      if (matchesKey(chunk, 'a')) { this.commandSelectedRun('apply'); return; }
-      if (matchesKey(chunk, 'v')) { this.commandSelectedRun('diff'); return; }
-      if (matchesKey(chunk, 't')) { this.commandSelectedRun('test'); return; }
-      if (matchesKey(chunk, 'f')) { this.commandSelectedRun('fix'); return; }
-      if (matchesKey(chunk, 'u')) { this.commandSelectedRun('undo'); return; }
-      if (matchesKey(chunk, 'd')) { this.commandSelectedRun('discard'); return; }
-      if (matchesKey(chunk, 'p')) { this.promptMode = true; this.prompt = '/plan '; this.renderToTerminal(); return; }
-      if (matchesKey(chunk, 'r')) { this.commandSelectedRun('review'); return; }
-      if (matchesKey(chunk, 'n')) { this.promptMode = false; this.prompt = ''; this.footerMessage = 'Composer ready — type directly.'; this.renderToTerminal(); return; }
-      if (matchesKey(chunk, 'enter') || chunk === '\r' || chunk === '\n') { this.promptMode = true; this.prompt = ''; this.renderToTerminal(); return; }
-      // Any printable char starts prompt
-      if (/^[\x20-\x7E]+$/.test(chunk)) { this.promptMode = true; this.prompt = chunk; this.renderToTerminal(); return; }
-    }
-
-    this.handlePromptInput(chunk);
+  private async handleInput(data: string): Promise<void> {
+    const unwrapped = parseCockpitInputChunk(data);
+    // Bracketed paste arrives as one block — insert it as a single token. Otherwise split the read
+    // into individual keys so coalesced/held arrows are each handled.
+    const tokens = unwrapped !== data ? [unwrapped] : splitKeyTokens(data);
+    for (const token of tokens) await this.handleKey(token);
   }
 
-  private handlePromptInput(data: string): void {
-    const chunk = parseCockpitInputChunk(data);
+  private async handleKey(chunk: string): Promise<void> {
+    if (matchesKey(chunk, 'ctrl+c')) { this.shutdown(); return; }
+    if (this.busy) return; // ignore keystrokes while a command is running
+    if (this.pendingMission) { await this.resolvePendingMission(chunk); return; } // waiting on y/N confirm
+
+    // PgUp/PgDn scroll the OUTPUT panel. (Arrow/page escapes contain \x1b so they never match the
+    // printable-character test used for prompt typing.)
+    if (chunk === '\x1b[5~') { this.scroll += 5; this.renderToTerminal(); return; }
+    if (chunk === '\x1b[6~') { this.scroll = Math.max(0, this.scroll - 5); this.renderToTerminal(); return; }
+
+    // The input line is always focused: arrows/Home/End/Delete edit it. Accept both CSI (\x1b[) and
+    // application-cursor SS3 (\x1bO) encodings.
+    if (chunk === '\x1b[D' || chunk === '\x1bOD') { this.cursor = Math.max(0, this.cursor - 1); this.renderToTerminal(); return; } // left
+    if (chunk === '\x1b[C' || chunk === '\x1bOC') { this.cursor = Math.min(this.prompt.length, this.cursor + 1); this.renderToTerminal(); return; } // right
+    if (chunk === '\x1b[A' || chunk === '\x1bOA') { this.onArrowVertical(-1); this.renderToTerminal(); return; } // up
+    if (chunk === '\x1b[B' || chunk === '\x1bOB') { this.onArrowVertical(1); this.renderToTerminal(); return; } // down
+    if (chunk === '\x1b[H' || chunk === '\x1bOH' || chunk === '\x1b[1~' || chunk === '\x1b[7~') { this.cursor = this.lineBounds().start; this.renderToTerminal(); return; } // home
+    if (chunk === '\x1b[F' || chunk === '\x1bOF' || chunk === '\x1b[4~' || chunk === '\x1b[8~') { this.cursor = this.lineBounds().end; this.renderToTerminal(); return; } // end
+    if (chunk === '\x1b[3~') { // delete (forward)
+      if (this.cursor < this.prompt.length) this.prompt = this.prompt.slice(0, this.cursor) + this.prompt.slice(this.cursor + 1);
+      this.renderToTerminal();
+      return;
+    }
+    if (matchesKey(chunk, 'escape')) { this.prompt = ''; this.cursor = 0; this.promptError = ''; this.renderToTerminal(); return; } // clear the line
+
+    await this.handlePromptInput(chunk);
+  }
+
+  // Up/Down move the cursor between input lines, or scroll the OUTPUT panel once the cursor is at the
+  // input's top/bottom edge (so a single-line chat box still scrolls the transcript naturally).
+  private onArrowVertical(direction: -1 | 1): void {
+    const { start, end } = this.lineBounds();
+    if (direction < 0 && start === 0) { this.scroll += 1; return; }
+    if (direction > 0 && end === this.prompt.length) { this.scroll = Math.max(0, this.scroll - 1); return; }
+    this.moveCursorVertical(direction);
+  }
+
+  // Bounds (in `prompt` indices) of the logical line the cursor currently sits on.
+  private lineBounds(): { start: number; end: number } {
+    const start = this.prompt.lastIndexOf('\n', this.cursor - 1) + 1;
+    const nextNl = this.prompt.indexOf('\n', this.cursor);
+    return { start, end: nextNl === -1 ? this.prompt.length : nextNl };
+  }
+
+  // Move the cursor up/down across logical (\n-separated) lines, preserving the column where possible.
+  private moveCursorVertical(direction: -1 | 1): void {
+    const { start, end } = this.lineBounds();
+    const col = this.cursor - start;
+    if (direction < 0) {
+      if (start === 0) { this.cursor = 0; return; }
+      const prevStart = this.prompt.lastIndexOf('\n', start - 2) + 1;
+      const prevLen = start - 1 - prevStart;
+      this.cursor = prevStart + Math.min(col, prevLen);
+    } else {
+      if (end === this.prompt.length) { this.cursor = this.prompt.length; return; }
+      const nextStart = end + 1;
+      const nextNl = this.prompt.indexOf('\n', nextStart);
+      const nextLen = (nextNl === -1 ? this.prompt.length : nextNl) - nextStart;
+      this.cursor = nextStart + Math.min(col, nextLen);
+    }
+  }
+
+  private async handlePromptInput(chunk: string): Promise<void> {
     this.promptError = '';
-    if (matchesKey(chunk, 'escape') || matchesKey(chunk, 'ctrl+c')) { this.promptMode = false; this.prompt = ''; this.renderToTerminal(); return; }
     if (matchesKey(chunk, 'enter') || chunk === '\r' || chunk === '\n') {
-      const command = parseCockpitOperatorCommand(this.prompt);
-      if (!command) { this.promptError = 'Type /plan <idea>, /code <idea>, /ask question, /continue, or /parallel <idea>'; this.renderToTerminal(); return; }
-      if (command.action === 'plan' || command.action === 'run') {
-        this.result = { kind: 'mission', command: command.action, mission: command.mission };
-        this.shutdown();
+      // A backslash immediately before the cursor is a continuation: replace it with a newline and
+      // keep composing instead of submitting.
+      if (this.cursor > 0 && this.prompt[this.cursor - 1] === '\\') {
+        this.prompt = `${this.prompt.slice(0, this.cursor - 1)}\n${this.prompt.slice(this.cursor)}`;
+        this.renderToTerminal();
         return;
       }
-      this.result = { kind: 'operator', command };
-      this.shutdown();
+      const text = this.prompt.trim();
+      // Manual context compaction (async, needs the assistant agent).
+      const lc = text.replace(/^\//, '').toLowerCase();
+      if (lc === 'summarize' || lc === 'compact') {
+        this.prompt = '';
+        this.cursor = 0;
+        this.push({ author: 'you', text, mine: true });
+        this.startSpinner();
+        try { await this.runSummary(false); } finally { this.stopSpinner(); this.renderToTerminal(); }
+        return;
+      }
+      // Cockpit-local commands (agent toggles, context, help) handled here without touching the controller.
+      if (this.tryLocalCommand(text)) { this.prompt = ''; this.cursor = 0; this.renderToTerminal(); return; }
+      const command = parseCockpitOperatorCommand(text);
+      if (!command) { this.promptError = 'Type /plan <idea>, /code <idea>, /ask question, /continue, or /parallel <idea>'; this.renderToTerminal(); return; }
+      this.prompt = '';
+      this.cursor = 0;
+      this.push({ author: 'you', text, mine: true });
+      // Plain prose that only *looks* like a coding mission: confirm before launching agents.
+      if ((command.action === 'run' || command.action === 'plan') && !isExplicitMissionCommand(text)) {
+        this.pendingMission = { command, text };
+        this.push({ author: 'system', text: `This looks like a coding mission: "${command.mission}". Press y to run the agents, or any other key to send it as a chat question instead.` });
+        this.renderToTerminal();
+        return;
+      }
+      await this.dispatch(command);
       return;
     }
     if (matchesKey(chunk, 'backspace') || chunk === '\x7f' || chunk === '\b') {
-      this.prompt = this.prompt.slice(0, -1);
+      if (this.cursor > 0) {
+        this.prompt = this.prompt.slice(0, this.cursor - 1) + this.prompt.slice(this.cursor);
+        this.cursor -= 1;
+      }
     } else if (/^[\x20-\x7E]+$/.test(chunk)) {
-      this.prompt += chunk;
+      this.prompt = this.prompt.slice(0, this.cursor) + chunk + this.prompt.slice(this.cursor);
+      this.cursor += chunk.length;
     }
     this.renderToTerminal();
   }
 
-  private commandSelectedRun(action: 'apply' | 'diff' | 'review' | 'status' | 'test' | 'fix' | 'discard' | 'undo'): void {
-    const runId = this.state.selected?.id;
-    if (!runId) { this.showFooter('No run selected yet.'); return; }
-    this.result = { kind: 'operator', command: { action, runId } };
-    this.shutdown();
+  // Resolve a confirmation for an auto-detected coding mission: 'y' runs the agents, anything else
+  // re-routes the original text to chat (/ask) instead.
+  private async resolvePendingMission(chunk: string): Promise<void> {
+    const pending = this.pendingMission;
+    this.pendingMission = undefined;
+    if (!pending) return;
+    if (chunk === 'y' || chunk === 'Y') {
+      await this.dispatch(pending.command);
+    } else {
+      this.push({ author: 'system', text: 'Sending it as a chat question instead.' });
+      await this.dispatch({ action: 'ask', prompt: pending.text });
+    }
   }
 
-  private showFooter(message: string): void {
-    this.footerMessage = message;
-    this.renderToTerminal();
+  // Agent enable/disable + help, handled entirely inside the cockpit. Returns true if it consumed
+  // the input.
+  private tryLocalCommand(text: string): boolean {
+    const normalized = text.replace(/^\//, '').trim();
+    const [verb, ...rest] = normalized.split(/\s+/);
+    const arg = rest.join(' ').trim();
+    const lower = (verb ?? '').toLowerCase();
+    if (lower === 'agents') {
+      this.push({ author: 'you', text, mine: true });
+      const lines = this.roster.length
+        ? this.roster.map((a) => `${this.disabledAgents.has(a.id) ? '[ ]' : '[x]'} ${a.id}  (${a.roles.join(', ') || 'agent'})`)
+        : ['(no roster configured)'];
+      this.push({ author: 'system', text: ['Agents (/enable <id>, /disable <id> to toggle):', ...lines].join('\n') });
+      return true;
+    }
+    if (lower === 'enable' || lower === 'disable') {
+      this.push({ author: 'you', text, mine: true });
+      if (!arg) { this.push({ author: 'system', text: `Usage: /${lower} <agent-id>` }); return true; }
+      const known = this.roster.some((a) => a.id === arg);
+      if (!known) { this.push({ author: 'system', text: `Unknown agent "${arg}". Known: ${this.roster.map((a) => a.id).join(', ') || '(none)'}` }); return true; }
+      if (lower === 'disable') this.disabledAgents.add(arg); else this.disabledAgents.delete(arg);
+      this.push({ author: 'system', text: `${arg} is now ${this.disabledAgents.has(arg) ? 'disabled' : 'enabled'}.` });
+      return true;
+    }
+    if (lower === 'clear' || lower === 'reset') {
+      this.push({ author: 'you', text, mine: true });
+      this.summary = '';
+      this.summarizedCount = this.conversation.length;
+      this.persist();
+      this.push({ author: 'system', text: 'Context cleared — agents start fresh from here. Earlier messages stay visible but are no longer sent.' });
+      return true;
+    }
+    if (lower === 'context') {
+      this.push({ author: 'you', text, mine: true });
+      const lines = [
+        `Context: ${this.contextTurns().length} recent turn(s), ~${this.contextChars()} chars (cap ~${CONTEXT_CHAR_BUDGET}, auto-summarize > ${AUTO_SUMMARIZE_CHARS}).`,
+        this.summary ? `Summary: ${this.summary.length} chars covering ${this.summarizedCount} earlier message(s).` : 'No summary yet.',
+        'Manage with: /summarize (compact now) · /clear (drop context).',
+      ];
+      this.push({ author: 'system', text: lines.join('\n') });
+      return true;
+    }
+    return false;
   }
 
-  private renderLines(width: number): string[] {
-    const selected = this.state.selected;
+  // Compress unsummarized turns into the rolling summary via the assistant. `auto` runs silently
+  // inside a chat dispatch; manual runs (/summarize) report success/failure.
+  private async runSummary(auto: boolean): Promise<void> {
+    const boundary = Math.max(this.summarizedCount, this.conversation.length - 1); // exclude the current line
+    const turns = this.conversation.slice(this.summarizedCount, boundary).filter((entry) => entry.author !== 'system' && entry.text.trim());
+    if (!turns.length) { if (!auto) this.push({ author: 'system', text: 'Nothing to summarize yet.' }); return; }
+    try {
+      const { summary } = await this.controller.summarize({ priorSummary: this.summary, turns });
+      if (summary.trim()) {
+        this.summary = summary.trim();
+        this.summarizedCount = boundary;
+        this.persist();
+        this.push({ author: 'system', text: `${auto ? 'Auto-summarized' : 'Summarized'} ${turns.length} earlier message(s) — context compacted.` });
+      } else if (!auto) {
+        this.push({ author: 'system', text: 'Summary came back empty; keeping full context.' });
+      }
+    } catch (error) {
+      if (!auto) this.push({ author: 'system', text: `Summarize failed: ${error instanceof Error ? error.message : String(error)}` });
+    }
+  }
+
+  // Run a command without ever leaving the cockpit: in-panel commands render their reply into the
+  // OUTPUT panel; suspending commands (missions/fix) temporarily drop the alt screen so they can
+  // stream output and prompt, then the dashboard re-renders in place with refreshed state.
+  private async dispatch(command: CockpitOperatorCommand): Promise<void> {
+    this.footerMessage = '';
+    this.scroll = 0;
+    try {
+      if (commandSuspends(command)) {
+        // Suspended work prints to the real terminal — no spinner timer (it would corrupt that output).
+        this.busy = true;
+        this.renderToTerminal();
+        this.push({ author: 'system', text: `Running ${describeCommand(command)} — live output below…` });
+        this.suspendScreen();
+        let result: CockpitCommandResult;
+        try {
+          result = await this.controller.runSuspended(command, { disabledAgents: [...this.disabledAgents] });
+        } finally {
+          this.resumeScreen();
+        }
+        this.state = result.state;
+        this.push({ author: 'system', text: result.output.trim() || `${describeCommand(command)} complete — see output above.` });
+      } else {
+        this.startSpinner();
+        // Auto-compact: fold older turns into the summary before a chat call if the verbatim context
+        // has grown past the threshold, so the assistant prompt stays bounded.
+        if ((command.action === 'ask' || command.action === 'web') && this.contextChars() > AUTO_SUMMARIZE_CHARS) {
+          await this.runSummary(true);
+        }
+        // Pass the (post-summary) recent turns + rolling summary so the assistant has bounded memory.
+        const result = await this.controller.runInline(command, { history: this.contextTurns(), summary: this.summary });
+        this.state = result.state;
+        this.push({ author: result.author, text: result.output.trim() || '(no output)' });
+      }
+    } catch (error) {
+      this.push({ author: 'system', text: error instanceof Error ? error.message : String(error) });
+    } finally {
+      this.stopSpinner();
+      this.scroll = 0;
+      this.renderToTerminal();
+    }
+  }
+
+  private suspendScreen(): void {
+    this.suspended = true;
+    this.stdout.off('resize', this.resizeHandler);
+    this.stdin.off('data', this.inputHandler);
+    if (this.stdin.setRawMode) this.stdin.setRawMode(false);
+    this.stdin.pause();
+    // Leave the alternate screen + show the cursor so streamed output and readline prompts work.
+    this.stdout.write('\x1b[?1049l\x1b[?25h');
+  }
+
+  private resumeScreen(): void {
+    this.suspended = false;
+    if (this.stdin.setRawMode) this.stdin.setRawMode(true);
+    this.stdin.resume();
+    this.stdin.on('data', this.inputHandler);
+    this.stdout.on('resize', this.resizeHandler);
+    this.stdout.write('\x1b[?1049h\x1b[?25l');
+  }
+
+  private renderFrame(width: number, height: number): string[] {
     const totalWidth = Math.max(100, width);
     const leftW = Math.max(28, Math.floor(totalWidth * 0.25));
     const midW = Math.max(42, Math.floor(totalWidth * 0.4));
     const rightW = totalWidth - leftW - midW - 4;
-    const colHeight = 14;
 
-    const lines: string[] = [];
+    const sessionTag = this.sessionId ? dim(` · session ${this.sessionId}`) : '';
+    const title = bold('xdou cockpit') + ' ' + dim('· type to chat · Ctrl+C quits') + sessionTag;
+    const header = this.state.selected ? renderMissionHeader(this.state, totalWidth) : renderEmptyMissionHeader(totalWidth);
+    const actions = renderActionsFooter(this.state, totalWidth);
+    const composer = renderPromptComposer(totalWidth, this.prompt, this.promptError, this.footerMessage, this.cursor);
 
-    if (!selected) {
-      const emptyLines = emptyCockpitLines(totalWidth, this.promptMode ? this.prompt : '');
-      if (this.promptError) emptyLines.push(red(`  ${this.promptError}`));
-      if (this.footerMessage) emptyLines.push(dim(`  ${this.footerMessage}`));
-      return emptyLines;
-    }
+    // Divide the remaining vertical space between the dashboard columns and the OUTPUT panel so the
+    // whole frame fits one screenful (no wrap/scroll) regardless of terminal height.
+    const fixed = 1 + header.length + actions.length + composer.length;
+    const body = Math.max(8, (height - 1) - fixed);
+    // Favor the OUTPUT panel: the dashboard columns take a smaller, capped slice and the rest goes
+    // to the conversation so longer replies are visible without scrolling.
+    const colHeight = Math.max(6, Math.min(10, Math.floor(body * 0.38)));
+    const outHeight = Math.max(6, body - colHeight);
 
-    // Mission header
-    lines.push(...renderMissionHeader(this.state, totalWidth));
-
-    // Three columns
-    const agents = agentsFromState(this.state);
-    lines.push(...threeColumn(
-      renderAgentsColumn(agents, leftW, colHeight),
-      renderTimelineColumn(this.state, midW, colHeight),
-      renderArtifactsColumn(this.state, rightW, colHeight),
-      leftW, midW
-    ));
-
-    // Actions footer
-    lines.push(...renderActionsFooter(this.state, totalWidth));
-
-    // Prompt composer
-    const promptText = this.promptMode ? this.prompt : '';
-    lines.push(...renderPromptComposer(totalWidth, promptText, this.promptError, this.footerMessage));
-
-    return lines;
+    // When a roster is configured, the AGENTS panel shows toggle state; otherwise fall back to the
+    // agents inferred from the run timeline.
+    const agentsCol = this.roster.length
+      ? renderRosterColumn(this.roster, this.disabledAgents, colHeight)
+      : renderAgentsColumn(agentsFromState(this.state), leftW, colHeight);
+    return [
+      title,
+      ...header,
+      ...threeColumn(
+        agentsCol,
+        renderTimelineColumn(this.state, midW, colHeight),
+        renderArtifactsColumn(this.state, rightW, colHeight),
+        leftW, midW, rightW,
+      ),
+      ...renderOutputPanel(this.conversation, totalWidth, outHeight, this.scroll, this.busyLabel()),
+      ...actions,
+      ...composer,
+    ];
   }
 
   private renderToTerminal(): void {
+    if (this.done || this.suspended) return; // never paint over a streaming mission's terminal output
     const width = this.stdout.columns || Number(process.env.COLUMNS) || 120;
     const height = this.stdout.rows || Number(process.env.LINES) || 30;
-    const lines = this.renderLines(width).slice(0, Math.max(1, height - 1));
+    // Cap to height-1 ROWS and clamp every line to the terminal width. A line wider than the
+    // terminal wraps onto extra physical rows, overflowing the height cap and forcing the terminal
+    // to scroll — which makes `\x1b[H` miss the true top and stacks a fresh copy of the frame into
+    // the scrollback on every render. Truncating keeps each frame exactly one screenful so the
+    // home+clear overwrites in place.
+    const lines = this.renderFrame(width, height)
+      .slice(0, Math.max(1, height - 1))
+      .map((line) => truncate(line, width - 1));
     // Move cursor to home and clear to end of screen (no full-screen clear flicker)
     this.stdout.write('\x1b[H\x1b[J' + lines.join('\r\n'));
   }
 
   private shutdown(): void {
+    if (this.done) return;
+    this.done = true;
+    this.stopSpinner(); // clear the render timer so the event loop can exit
     this.stdin.off('data', this.inputHandler);
     this.stdout.off('resize', this.resizeHandler);
     if (this.stdin.setRawMode) this.stdin.setRawMode(this.wasRaw);
-    // Exit alternate screen buffer
+    this.stdin.pause();
+    // Exit alternate screen buffer + restore cursor
     this.stdout.write('\x1b[?1049l\x1b[?25h\r\n');
-    this.onExit(this.result);
+    this.onExit();
   }
 }
 
-export async function launchCockpit(state: CockpitState): Promise<CockpitLaunchResult> {
-  return new Promise<CockpitLaunchResult>((resolve) => {
-    const app = new VisualCockpit(state, resolve);
+export async function launchCockpit(state: CockpitState, controller: CockpitController, options: CockpitLaunchOptions = {}): Promise<void> {
+  return new Promise<void>((resolve) => {
+    const app = new VisualCockpit(state, controller, resolve, options);
     app.start();
   });
 }

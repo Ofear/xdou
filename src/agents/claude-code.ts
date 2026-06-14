@@ -41,9 +41,13 @@ export class ClaudeCodeAdapter extends CliAgentAdapter {
     const role = /ROLE:\s*([a-z-]+)/i.exec(input.prompt)?.[1]?.toLowerCase();
     const isNonMutatingRole = role ? !['implementer', 'fixer', 'tester'].includes(role) : false;
     const maxTurns = role === 'reviewer' ? Math.min(this.maxTurns, 5) : this.maxTurns;
-    const toolArgs = isNonMutatingRole
-      ? ['--allowedTools', NON_MUTATING_ALLOWED_TOOLS]
-      : ['--permission-mode', 'bypassPermissions'];
+    // Web research: explicitly enable (only) the read-only web tools so the model can actually search
+    // and cannot touch the filesystem. xdou controls the capability rather than hoping it's on.
+    const toolArgs = input.web
+      ? ['--allowedTools', 'WebSearch,WebFetch']
+      : isNonMutatingRole
+        ? ['--allowedTools', NON_MUTATING_ALLOWED_TOOLS]
+        : ['--permission-mode', 'bypassPermissions'];
     return { command: this.command, args: ['-p', input.prompt, '--max-turns', String(maxTurns), '--output-format', 'json', ...toolArgs], cwd: input.cwd, shell: false };
   }
 

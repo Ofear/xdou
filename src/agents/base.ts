@@ -6,6 +6,17 @@ export function sanitizeAgentText(value: string): string {
   return value.replace(/\0/g, '');
 }
 
+// Track in-flight agent subprocesses so an abort (Ctrl+C) can terminate them promptly instead of
+// leaving long-running CLIs (claude/codex) orphaned after xdou exits.
+interface KillableChild { kill(signal?: NodeJS.Signals): boolean }
+const inFlight = new Set<KillableChild>();
+export function killInFlightAgents(): void {
+  for (const child of inFlight) {
+    try { child.kill('SIGTERM'); } catch { /* already gone */ }
+  }
+  inFlight.clear();
+}
+
 function sanitizeInvocation(invocation: AgentInvocation): AgentInvocation {
   return {
     ...invocation,
@@ -50,7 +61,14 @@ export abstract class CliAgentAdapter implements AgentAdapter {
         ...(invocation.stdin ? { input: invocation.stdin } : { stdin: 'ignore' as const }),
         ...(invocation.env ? { env: invocation.env } : {}),
       };
-      const result = await execa(invocation.command, invocation.args, options);
+      const child = execa(invocation.command, invocation.args, options);
+      inFlight.add(child);
+      let result;
+      try {
+        result = await child;
+      } finally {
+        inFlight.delete(child);
+      }
       return {
         agent: this.id,
         command: invocation.command,

@@ -16,13 +16,21 @@ export function expectedSymbolsFromMission(mission: string): string[] {
   return [...symbols];
 }
 
+// Only the lines a change actually adds (`+`, excluding the `+++` file header) count as evidence a
+// symbol was implemented — so a symbol that merely appears in surrounding context or a removed line
+// can't falsely satisfy the gate.
+function addedLines(diff: string): string {
+  return diff.split(/\r?\n/).filter((line) => line.startsWith('+') && !line.startsWith('+++')).join('\n');
+}
+
 export function checkMissionCompletion(mission: string, diff: string): MissionCheck {
   const expectedSymbols = expectedSymbolsFromMission(mission);
   const effectiveDiff = diff.trim() === 'No diff produced.' ? '' : diff;
+  const added = addedLines(effectiveDiff);
   if (!expectedSymbols.length) {
     return { status: effectiveDiff.trim() ? 'passed' : 'skipped', expectedSymbols, missingSymbols: [], message: effectiveDiff.trim() ? 'No explicit function symbols found in mission; non-empty diff produced.' : 'No explicit function symbols found in mission.' };
   }
-  const missingSymbols = expectedSymbols.filter((symbol) => !new RegExp(`\\b${escapeRegExp(symbol)}\\b`).test(effectiveDiff));
+  const missingSymbols = expectedSymbols.filter((symbol) => !new RegExp(`\\b${escapeRegExp(symbol)}\\b`).test(added));
   return {
     status: missingSymbols.length ? 'failed' : 'passed',
     expectedSymbols,

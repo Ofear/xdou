@@ -3,7 +3,8 @@ import { temporaryDirectory } from 'tempy';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { execa } from 'execa';
-import { parseCockpitInputChunk, parseCockpitMissionCommand, parseCockpitOperatorCommand, renderCockpitSnapshot } from '../src/tui/cockpit.js';
+import { parseCockpitInputChunk, parseCockpitMissionCommand, parseCockpitOperatorCommand, renderCockpitSnapshot, renderMarkdownLines } from '../src/tui/cockpit.js';
+import stripAnsi from 'strip-ansi';
 
 const repoRoot = resolve(__dirname, '..');
 const cli = [join(repoRoot, 'node_modules', 'tsx', 'dist', 'cli.mjs'), join(repoRoot, 'src', 'cli.ts')];
@@ -69,10 +70,10 @@ describe('cockpit command', () => {
     expect(result.stdout).toContain('AGENTS');
     expect(result.stdout).toContain('TIMELINE (live)');
     expect(result.stdout).toContain('ARTIFACTS');
-    // Actions footer box
-    expect(result.stdout).toContain('[1] Fix (f)');
-    expect(result.stdout).toContain('[2] Discard (d)');
-    expect(result.stdout).toContain('[3] Review diff (v)');
+    // Actions footer box (slash-command hints)
+    expect(result.stdout).toContain('/fix blockers');
+    expect(result.stdout).toContain('/discard');
+    expect(result.stdout).toContain('/diff view changes');
     // Prompt composer box
     expect(result.stdout).toContain('Prompt: /ask question');
     expect(result.stdout).toContain('/ask /find /web do not require Git');
@@ -89,8 +90,8 @@ describe('cockpit command', () => {
     const cwd = temporaryDirectory();
     const result = await runCli(['cockpit', '--snapshot', '--cwd', cwd]);
     expect(result.stdout).toContain('xdou visual cockpit');
-    // Empty mission header box
-    expect(result.stdout).toContain('Waiting for operator prompt...');
+    // Empty mission header box (chat-first wording, no stale "waiting" copy)
+    expect(result.stdout).toContain('No active mission');
     // Three columns with default agents - note: role truncated due to column width
     expect(result.stdout).toContain('AGENTS');
     expect(result.stdout).toContain('⚪ claude');
@@ -104,13 +105,13 @@ describe('cockpit command', () => {
     expect(result.stdout).toContain('ARTIFACTS');
     expect(result.stdout).toContain('plan.md');
     expect(result.stdout).toContain('(not created)');
-    // Actions footer
-    expect(result.stdout).toContain('[1] /ask Question');
-    expect(result.stdout).toContain('[2] /find File');
-    expect(result.stdout).toContain('[3] /web Search');
-    expect(result.stdout).toContain('[4] /plan Mission');
-    expect(result.stdout).toContain('[5] /code Mission');
-    expect(result.stdout).toContain('[6] Quit');
+    // Actions footer (slash-command hints)
+    expect(result.stdout).toContain('/ask <q>');
+    expect(result.stdout).toContain('/find <file>');
+    expect(result.stdout).toContain('/web <topic>');
+    expect(result.stdout).toContain('/plan <idea>');
+    expect(result.stdout).toContain('/code <idea>');
+    expect(result.stdout).toContain('Ctrl+C quits');
     // Prompt composer
     expect(result.stdout).toContain('Prompt: /ask question');
     expect(result.stdout).toContain('/ask /find /web do not require Git. /code and /run will initialize Git in a project folder.');
@@ -163,9 +164,36 @@ describe('cockpit command', () => {
     expect(parseCockpitOperatorCommand('/code hi')).toBeUndefined();
   });
 
+  it('routes natural-language web searches to /web, not file find', () => {
+    expect(parseCockpitOperatorCommand('Search the web for Wix stock price')).toEqual({ action: 'web', query: 'Wix stock price' });
+    expect(parseCockpitOperatorCommand('search the web for cats')).toEqual({ action: 'web', query: 'cats' });
+    expect(parseCockpitOperatorCommand('google latest node lts')).toEqual({ action: 'web', query: 'latest node lts' });
+    const lookup = parseCockpitOperatorCommand('look up the weather online');
+    expect(lookup?.action).toBe('web');
+    // file searches still go to find — bare "web" as an adjective is NOT web research
+    expect(parseCockpitOperatorCommand('search package.json')).toEqual({ action: 'find', query: 'package.json' });
+    expect(parseCockpitOperatorCommand('search web component')).toEqual({ action: 'find', query: 'web component' });
+    expect(parseCockpitOperatorCommand('/find src/cli.ts')).toEqual({ action: 'find', query: 'src/cli.ts' });
+    expect(parseCockpitOperatorCommand('/web wix stock price')).toEqual({ action: 'web', query: 'wix stock price' });
+  });
+
+  it('renders agent Markdown into styled, width-bounded lines', () => {
+    const lines = renderMarkdownLines('**Wix.com (NASDAQ: WIX): $45.91 USD**, up **+4.18%** on the day.\n\n- one\n- `code` item\n# Heading', 80);
+    const plain = lines.map(stripAnsi);
+    // markers are consumed (no literal ** or backticks left), bullets become •
+    expect(plain.join('\n')).not.toContain('**');
+    expect(plain.join('\n')).not.toContain('`');
+    expect(plain.some((l) => l.startsWith('• one'))).toBe(true);
+    expect(plain.some((l) => l.includes('Heading') && !l.includes('#'))).toBe(true);
+    // styling actually applied (ANSI bold present somewhere)
+    expect(lines.join('\n')).toContain('\x1b[1m');
+    // never exceeds the requested width
+    expect(Math.max(...plain.map((l) => l.length))).toBeLessThanOrEqual(80);
+  });
+
   it('shows typed prompt text in the visible composer instead of hiding it in an overlay', () => {
     const output = renderCockpitSnapshot({ runs: [], selected: undefined, timeline: [], verdicts: [], artifacts: { plan: [], diff: [], review: [], summary: [] } }, 120, 'plan test cockpit prompt');
-    expect(output).toContain('Prompt: plan test cockpit prompt█');
+    expect(output).toContain('Prompt: plan test cockpit prompt');
     expect(output).toContain('/ask /find /web do not require Git. /code and /run will initialize Git in a project folder.');
   });
 
@@ -174,7 +202,22 @@ describe('cockpit command', () => {
     const maxLineWidth = Math.max(...output.split('\n').map((line) => [...line].length));
     expect(maxLineWidth).toBeLessThanOrEqual(140);
     expect(output).toContain('architect / rev'); // truncated in column
-    expect(output).toContain('operator prompt');
+    expect(output).toContain('No active mission');
+  });
+
+  it('never overflows the terminal width even with long artifact/timeline content', () => {
+    // Regression: an un-truncated right column overflowed the layout width, wrapped onto
+    // extra physical rows, and scrolled the TUI — duplicating the whole frame on every render.
+    const longLine = 'x'.repeat(300);
+    const output = renderCockpitSnapshot({
+      runs: [],
+      selected: { id: 'run-1', mission: longLine, createdAt: '', updatedAt: '', status: 'completed', phase: 'done', artifactDir: '', events: 5 },
+      timeline: [{ time: '2026-01-01T00:00:00Z', type: 'validation.finished', by: longLine, verdict: longLine, status: undefined, phase: undefined, ok: true }],
+      verdicts: [{ agent: 'claude', verdict: 'request_changes', confidence: 0.9, reason: longLine, missingRequirements: [longLine] }],
+      artifacts: { plan: [longLine], diff: ['diff --git a/x b/x'], review: [longLine], summary: [longLine] },
+    }, 120);
+    const maxLineWidth = Math.max(...output.split('\n').map((line) => [...line].length));
+    expect(maxLineWidth).toBeLessThanOrEqual(120);
   });
 
   it('counts changed files from live patch deltas when diff preview is truncated', () => {
