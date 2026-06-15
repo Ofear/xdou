@@ -41,7 +41,13 @@ export function buildAssistantPrompt(cwd: string, prompt: string, history: Assis
   const transcript = transcriptOf(capHistory(history));
   const summaryBlock = summary.trim() ? `Summary of earlier conversation:\n${summary.trim()}\n\n` : '';
   const contextBlock = transcript ? `Recent conversation (most recent last):\n${transcript}\n\n` : '';
-  return `You are the xdou cockpit assistant. Answer directly and concisely. Do not modify files unless explicitly asked. Current folder: ${cwd}\n\n${summaryBlock}${contextBlock}Reply to the user's latest message:\n${prompt}`;
+  return `You are the xdou cockpit assistant. Answer directly and concisely. Do not modify files unless explicitly asked. Current folder: ${cwd}
+
+This is a SINGLE synchronous turn: whatever you produce now is the complete, final reply shown to the user — there is no background processing and no later turn. Therefore:
+- NEVER claim work is "running"/"in progress" or that you will "compile results", "report back", or "follow up" later. You cannot run other agents (codex/claude) or background tasks from here.
+- Do the work now and give the actual answer in this reply. If it genuinely needs the multi-agent pipeline (e.g. "review the whole codebase with codex and claude"), say so plainly and tell the user to run it as a mission: /code <task> or /plan <task>. Do not pretend to orchestrate agents yourself.
+
+${summaryBlock}${contextBlock}Reply to the user's latest message:\n${prompt}`;
 }
 
 // Strict research prompt: the agent must use its web tools, must not fabricate, and must declare

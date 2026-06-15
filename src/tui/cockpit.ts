@@ -1515,6 +1515,8 @@ class VisualCockpit {
     this.startSpinner(busyLabelFor(command));
     // Missions write live timeline/artifact events; poll them so the dashboard shows progress.
     if (isMissionCommand(command)) this.startLivePoll();
+    const startedAt = Date.now();
+    let failed = false;
     try {
       if (isMissionCommand(command)) {
         // Missions can take minutes, but agents always run with piped (non-TTY) stdio — nothing needs
@@ -1536,11 +1538,16 @@ class VisualCockpit {
         this.push({ author: result.author, text: result.output.trim() || '(no output)' });
       }
     } catch (error) {
+      failed = true;
       this.push({ author: 'system', text: error instanceof Error ? error.message : String(error) });
     } finally {
       this.stopLivePoll();
       this.stopSpinner();
       this.scroll = 0;
+      // Explicit closure so the operator always knows the turn ended (and how long it took) — no more
+      // wondering whether it's still running, finished, or crashed.
+      const took = formatDuration(Date.now() - startedAt);
+      this.footerMessage = failed ? `✗ ${busyLabelFor(command)} failed after ${took}` : `✓ done in ${took}`;
       this.renderToTerminal();
     }
   }
