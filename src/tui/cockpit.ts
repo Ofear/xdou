@@ -787,6 +787,9 @@ export interface CockpitController {
   // Create a NEW session seeded with the given (truncated) conversation and re-point persistence at
   // it, leaving the original session untouched. Returns the new session id.
   branchSession(seed: { entries: ConversationEntry[]; summary: string; summarizedCount: number }): Promise<{ id: string }>;
+  // Re-read the latest run's live state (timeline/artifacts/phase) — polled while a mission runs so
+  // the dashboard shows progress in real time instead of freezing until the mission returns.
+  refreshState(): Promise<CockpitState>;
 }
 
 export interface CockpitSessionSummary { id: string; updatedAt: string; messages: number; last: string }
@@ -838,6 +841,33 @@ function describeCommand(command: CockpitOperatorCommand): string {
   if (command.action === 'run') return `mission: ${command.mission}`;
   if (command.action === 'parallel') return `parallel: ${command.mission}`;
   return command.action;
+}
+
+// Human-readable spinner label so "working…" actually says what's running.
+function busyLabelFor(command: CockpitOperatorCommand): string {
+  switch (command.action) {
+    case 'ask': return 'asking the assistant';
+    case 'web': return 'searching the web';
+    case 'find': return 'searching files';
+    case 'plan': return 'planning';
+    case 'run': return 'running mission';
+    case 'parallel': return 'running parallel missions';
+    case 'fix': return 'fixing';
+    case 'review': return 'reviewing';
+    case 'test': return 'running tests';
+    default: return command.action;
+  }
+}
+
+// Turn an orchestrator phase id (e.g. "implementation", "review_fix") into a readable label for the
+// live spinner: "running mission · implementing".
+function humanizePhase(phase: string): string {
+  const map: Record<string, string> = {
+    created: 'starting', council: 'brainstorming', planning: 'planning', planning_failed: 'planning failed',
+    synthesis: 'designing', implementation: 'implementing', validation: 'validating', review: 'reviewing',
+    fixing: 'fixing', failed: 'failed', completed: 'done', applied: 'applied', aborted: 'aborted',
+  };
+  return map[phase] ?? phase.replace(/_/g, ' ');
 }
 
 // Word-wrap plain (ANSI-free) conversation text to a column width so the OUTPUT panel never
@@ -984,8 +1014,10 @@ class VisualCockpit {
   private footerMessage = '';
   private busy = false;
   private busyStart = 0;
+  private busyDetail = 'working';   // what the spinner says we're doing (e.g. "running mission · planning")
   private spinnerTick = 0;
   private spinnerTimer: ReturnType<typeof setInterval> | undefined;
+  private liveTimer: ReturnType<typeof setInterval> | undefined; // polls run state while a mission runs
   private scroll = 0;
   private menuIndex = 0; // highlighted row in the slash-command palette
   private done = false;
@@ -1027,8 +1059,9 @@ class VisualCockpit {
 
   // An animated spinner with an elapsed-seconds counter, re-rendered on a timer so a long agent call
   // visibly progresses instead of looking frozen. Only used for in-cockpit (non-suspended) work.
-  private startSpinner(): void {
+  private startSpinner(detail = 'working'): void {
     this.busy = true;
+    this.busyDetail = detail;
     this.busyStart = Date.now();
     this.spinnerTick = 0;
     if (this.spinnerTimer) clearInterval(this.spinnerTimer);
@@ -1038,6 +1071,7 @@ class VisualCockpit {
 
   private stopSpinner(): void {
     this.busy = false;
+    this.busyDetail = 'working';
     if (this.spinnerTimer) { clearInterval(this.spinnerTimer); this.spinnerTimer = undefined; }
   }
 
@@ -1045,7 +1079,29 @@ class VisualCockpit {
     if (!this.busy) return '';
     const frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
     const elapsed = this.busyStart ? Math.floor((Date.now() - this.busyStart) / 1000) : 0;
-    return `${frames[this.spinnerTick % frames.length] ?? '⠿'} working… ${elapsed}s`;
+    return `${frames[this.spinnerTick % frames.length] ?? '⠿'} ${this.busyDetail}… ${elapsed}s`;
+  }
+
+  // While a mission runs, poll the latest run's state every second so TIMELINE/ARTIFACTS and the
+  // phase in the spinner update live instead of freezing until the mission returns.
+  private startLivePoll(): void {
+    if (this.liveTimer) clearInterval(this.liveTimer);
+    this.liveTimer = setInterval(() => { void this.pollLiveState(); }, 1000);
+  }
+
+  private stopLivePoll(): void {
+    if (this.liveTimer) { clearInterval(this.liveTimer); this.liveTimer = undefined; }
+  }
+
+  private async pollLiveState(): Promise<void> {
+    if (!this.busy) return;
+    try {
+      const state = await this.controller.refreshState();
+      this.state = state;
+      const phase = state.selected?.phase;
+      if (phase) this.busyDetail = `running mission · ${humanizePhase(phase)}`;
+      this.renderToTerminal();
+    } catch { /* transient read error — keep the last good state */ }
   }
 
   // Append a conversation entry and persist the session (for resume).
@@ -1418,7 +1474,9 @@ class VisualCockpit {
   private async dispatch(command: CockpitOperatorCommand): Promise<void> {
     this.footerMessage = '';
     this.scroll = 0;
-    this.startSpinner();
+    this.startSpinner(busyLabelFor(command));
+    // Missions write live timeline/artifact events; poll them so the dashboard shows progress.
+    if (isMissionCommand(command)) this.startLivePoll();
     try {
       if (isMissionCommand(command)) {
         // Missions can take minutes, but agents always run with piped (non-TTY) stdio — nothing needs
@@ -1442,6 +1500,7 @@ class VisualCockpit {
     } catch (error) {
       this.push({ author: 'system', text: error instanceof Error ? error.message : String(error) });
     } finally {
+      this.stopLivePoll();
       this.stopSpinner();
       this.scroll = 0;
       this.renderToTerminal();
@@ -1517,6 +1576,7 @@ class VisualCockpit {
     // Ctrl+C may land mid-mission. Kill any in-flight agent subprocesses so their promises settle and
     // the process can actually exit — otherwise node lingers in the background until agents finish.
     killInFlightAgents();
+    this.stopLivePoll();
     this.stopSpinner(); // clear the render timer so the event loop can exit
     this.stdin.off('data', this.inputHandler);
     this.stdout.off('resize', this.resizeHandler);

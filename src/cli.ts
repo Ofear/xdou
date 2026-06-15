@@ -383,6 +383,8 @@ class Xdou extends Command {
         createdAt = now;
         return { id };
       },
+      // Live progress poll: re-read the latest run so the dashboard updates while a mission runs.
+      refreshState: async () => readCockpitState(orchestrator.store),
       // Missions (plan/run/parallel/fix) drive the agent pipeline. Agents run with piped stdio, so we
       // capture their log output and hand it back for the OUTPUT panel — the cockpit stays on screen
       // with a live spinner rather than dropping to a blank terminal while the mission runs.
