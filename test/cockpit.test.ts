@@ -3,7 +3,7 @@ import { temporaryDirectory } from 'tempy';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { execa } from 'execa';
-import { SLASH_COMMANDS, contractHome, filterSlashCommands, formatCharCount, parseCockpitInputChunk, parseCockpitMissionCommand, parseCockpitOperatorCommand, renderCockpitSnapshot, renderMarkdownLines } from '../src/tui/cockpit.js';
+import { SLASH_COMMANDS, contractHome, filterSlashCommands, formatCharCount, formatDuration, parseCockpitInputChunk, parseCockpitMissionCommand, parseCockpitOperatorCommand, renderCockpitSnapshot, renderMarkdownLines } from '../src/tui/cockpit.js';
 import { homedir } from 'node:os';
 import stripAnsi from 'strip-ansi';
 
@@ -280,6 +280,14 @@ describe('workspace header helpers', () => {
     expect(formatCharCount(999)).toBe('999 chars');
     expect(formatCharCount(1000)).toBe('1.0k chars');
     expect(formatCharCount(4137)).toBe('4.1k chars');
+  });
+
+  it('formats run durations compactly', () => {
+    expect(formatDuration(45_000)).toBe('45s');
+    expect(formatDuration(133_000)).toBe('2m13s');
+    expect(formatDuration(3_840_000)).toBe('1h04m');
+    expect(formatDuration(-5)).toBe('—');       // guards against bad/missing timestamps
+    expect(formatDuration(Number.NaN)).toBe('—');
   });
 });
 

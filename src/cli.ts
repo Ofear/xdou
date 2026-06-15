@@ -10,7 +10,7 @@ import { execa } from 'execa';
 import { XdouOrchestrator } from './orchestrator.js';
 import { defaultConfig, type TeamConfig, type XdouConfig } from './config/schema.js';
 import { loadConfig } from './config/load.js';
-import { isActionableCodingMission, launchCockpit, readCockpitState, renderCockpitSnapshot, type CockpitController, type CockpitOperatorCommand, type ConversationEntry } from './tui/cockpit.js';
+import { formatDuration, isActionableCodingMission, launchCockpit, readCockpitState, renderCockpitSnapshot, type CockpitController, type CockpitOperatorCommand, type ConversationEntry } from './tui/cockpit.js';
 import { deleteSession, isEmptySession, listSessions, newSessionId, pruneEmptySessions, readSession, writeSession } from './core/cockpit-sessions.js';
 import { filterTeam, teamRoster } from './core/cockpit-team.js';
 import { buildAssistantPrompt, buildSummaryPrompt, buildWebSearchPrompt, parseWebProvenance } from './core/assistant-prompt.js';
@@ -265,8 +265,13 @@ class Xdou extends Command {
     const runs = await orchestrator.store.listRuns();
     if (json) { this.log(JSON.stringify(runs, null, 2)); return; }
     if (!runs.length) { this.log('No runs found.'); return; }
-    const table = new Table({ head: ['run', 'status', 'phase', 'mission'] });
-    for (const run of runs) table.push([run.id, run.status, run.phase, run.mission]);
+    const table = new Table({ head: ['run', 'status', 'phase', 'took', 'mission'] });
+    for (const run of runs) {
+      const ongoing = run.status === 'running' || run.status === 'created';
+      const startMs = Date.parse(run.createdAt);
+      const took = Number.isFinite(startMs) ? formatDuration((ongoing ? Date.now() : Date.parse(run.updatedAt)) - startMs) : '—';
+      table.push([run.id, run.status, run.phase, took, run.mission]);
+    }
     this.log(table.toString());
   }
 

@@ -454,7 +454,13 @@ function renderMissionHeader(state: CockpitState, width: number): string[] {
 
   const missionLine = `  ${bold(selected.mission)}`;
   const statusLine = `  Status: ${bold(selected.status)}  │  Phase: ${selected.phase}  │  Tests: ${state.timeline.some(e => e.type === 'validation.finished' && e.ok) ? green('PASS') : state.timeline.some(e => e.type === 'validation.finished' && !e.ok) ? red('FAIL') : dim('pending')}  │  Risk: ${selected.status === 'completed' ? green('LOW') : selected.status === 'blocked' ? red('HIGH') : dim('unknown')}`;
-  const idLine = `  Run: ${dim(selected.id)}`;
+  // How long the run has taken — live for an in-progress run, total once it finished — so a slow run
+  // is obvious at a glance.
+  const running = selected.status === 'running' || selected.status === 'created';
+  const startMs = Date.parse(selected.createdAt);
+  const elapsedMs = (running ? Date.now() : Date.parse(selected.updatedAt)) - startMs;
+  const durText = Number.isFinite(startMs) ? formatDuration(elapsedMs) : '—';
+  const idLine = `  Run: ${dim(selected.id)}   ${dim('·')}   ${running ? yellow(`running ${durText}`) : dim(`took ${durText}`)}`;
 
   const contentWidth = width - 4;
   const lines = [
@@ -476,6 +482,16 @@ export function contractHome(path: string): string {
 
 export function formatCharCount(chars: number): string {
   return chars >= 1000 ? `${(chars / 1000).toFixed(1)}k chars` : `${chars} chars`;
+}
+
+// Compact human duration: "45s", "2m13s", "1h04m". Used for run elapsed/total time.
+export function formatDuration(ms: number): string {
+  if (!Number.isFinite(ms) || ms < 0) return '—';
+  const totalSec = Math.floor(ms / 1000);
+  if (totalSec < 60) return `${totalSec}s`;
+  const min = Math.floor(totalSec / 60);
+  if (min < 60) return `${min}m${String(totalSec % 60).padStart(2, '0')}s`;
+  return `${Math.floor(min / 60)}h${String(min % 60).padStart(2, '0')}m`;
 }
 
 // One-line workspace bar: where we are (path), the branch (or "no git"), and how full the chat
@@ -512,13 +528,16 @@ function renderAgentsColumn(agents: AgentCard[], width: number, height: number):
 }
 
 // The toggleable roster: each agent shows a checkbox reflecting whether it participates in runs.
-function renderRosterColumn(roster: CockpitRosterAgent[], disabled: Set<string>, height: number): string[] {
+function renderRosterColumn(roster: CockpitRosterAgent[], disabled: Set<string>, height: number, active: Set<string> = new Set()): string[] {
   const lines: string[] = [`${bold('AGENTS')}  ${dim('/enable /disable')}`];
   for (const agent of roster) {
     const off = disabled.has(agent.id);
-    const box = off ? dim('[ ]') : green('[x]');
+    const isActive = !off && active.has(agent.id);
+    // While a mission runs, the agent(s) whose role matches the current phase get a ● working badge.
+    const box = off ? dim('[ ]') : isActive ? yellow('●') : green('[x]');
     const name = off ? dim(agent.id) : authorStyle(agent.id)(agent.id);
-    lines.push(`${box} ${name}  ${dim(agent.roles.join(', ') || 'agent')}`);
+    const badge = isActive ? `  ${yellow('working…')}` : '';
+    lines.push(`${box} ${name}  ${dim(agent.roles.join(', ') || 'agent')}${badge}`);
     lines.push('');
   }
   while (lines.length < height) lines.push('');
@@ -857,6 +876,25 @@ function busyLabelFor(command: CockpitOperatorCommand): string {
     case 'test': return 'running tests';
     default: return command.action;
   }
+}
+
+// Which team roles are doing the work in a given pipeline phase — used to flag the active agent(s)
+// in the AGENTS panel while a mission runs.
+function rolesForPhase(phase: string): string[] {
+  switch (phase) {
+    case 'created': case 'council': return ['brainstormer'];
+    case 'planning': case 'synthesis': return ['architect'];
+    case 'implementation': return ['implementer'];
+    case 'review': return ['reviewer'];
+    case 'fixing': return ['fixer'];
+    default: return [];
+  }
+}
+
+function activeAgentsForPhase(phase: string, roster: CockpitRosterAgent[]): Set<string> {
+  const roles = rolesForPhase(phase);
+  if (!roles.length) return new Set();
+  return new Set(roster.filter((agent) => agent.roles.some((role) => roles.includes(role))).map((agent) => agent.id));
 }
 
 // Turn an orchestrator phase id (e.g. "implementation", "review_fix") into a readable label for the
@@ -1533,9 +1571,11 @@ class VisualCockpit {
     const outHeight = Math.max(6, body - colHeight);
 
     // When a roster is configured, the AGENTS panel shows toggle state; otherwise fall back to the
-    // agents inferred from the run timeline.
+    // agents inferred from the run timeline. While a mission polls, flag the phase's active agent(s).
+    const livePhase = this.liveTimer && this.busy ? this.state.selected?.phase : undefined;
+    const activeAgents = livePhase ? activeAgentsForPhase(livePhase, this.roster) : new Set<string>();
     const agentsCol = this.roster.length
-      ? renderRosterColumn(this.roster, this.disabledAgents, colHeight)
+      ? renderRosterColumn(this.roster, this.disabledAgents, colHeight, activeAgents)
       : renderAgentsColumn(agentsFromState(this.state), leftW, colHeight);
     const workspace = renderWorkspaceBar(this.cwd, this.branch, this.contextChars(), this.contextTurns().length);
     return [
