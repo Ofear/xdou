@@ -50,6 +50,24 @@ This is a SINGLE synchronous turn: whatever you produce now is the complete, fin
 ${summaryBlock}${contextBlock}Reply to the user's latest message:\n${prompt}`;
 }
 
+// Read-only codebase analysis prompt: the agent reads the project and reports concrete findings for
+// `request` (e.g. "find possible bugs") WITHOUT modifying anything. Used by the auto-routed review path.
+export function buildReviewPrompt(cwd: string, request: string): string {
+  return [
+    `You are reviewing the software project at ${cwd}.`,
+    `Task: ${request}`,
+    '',
+    'Rules:',
+    '- READ-ONLY: inspect files with your read/search tools. Do NOT modify, create, or delete any files.',
+    '- Base every finding on code you actually read — cite file paths and line numbers. Do not speculate or invent issues.',
+    '- Report concrete, actionable findings. For each: what & where (file:line), why it is a problem, and a suggested fix.',
+    '- If you find nothing notable in an area, say so rather than padding.',
+    '- This is a single synchronous turn: produce the complete findings now. Do not claim work is still running or that you will follow up later.',
+    '',
+    'Format: a short summary line, then a markdown list of findings ordered by severity.',
+  ].join('\n');
+}
+
 // Strict research prompt: the agent must use its web tools, must not fabricate, and must declare
 // whether it actually searched (parsed back out via parseWebProvenance).
 export function buildWebSearchPrompt(query: string, history: AssistantTurn[] = [], summary = ''): string {

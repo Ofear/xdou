@@ -3,7 +3,7 @@ import { temporaryDirectory } from 'tempy';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { execa } from 'execa';
-import { SLASH_COMMANDS, contractHome, filterSlashCommands, formatCharCount, formatDuration, parseCockpitInputChunk, parseCockpitMissionCommand, parseCockpitOperatorCommand, renderCockpitSnapshot, renderMarkdownLines } from '../src/tui/cockpit.js';
+import { SLASH_COMMANDS, contractHome, filterSlashCommands, formatCharCount, formatDuration, isBuildIntent, isReviewIntent, parseCockpitInputChunk, parseCockpitMissionCommand, parseCockpitOperatorCommand, renderCockpitSnapshot, renderMarkdownLines } from '../src/tui/cockpit.js';
 import { homedir } from 'node:os';
 import stripAnsi from 'strip-ansi';
 
@@ -297,6 +297,24 @@ describe('slash command palette', () => {
     expect(filterSlashCommands('c').map((c) => c.name)).toEqual(['code', 'continue', 'context', 'clear']);
     expect(filterSlashCommands('web').map((c) => c.name)).toEqual(['web']);
     expect(filterSlashCommands('zzz')).toEqual([]);                                 // no match → menu closes
+  });
+
+  it('routes review vs build intent for smart auto-run', () => {
+    // review/analysis (read-only) intent
+    expect(isReviewIntent('go over this project with codex and claude and find possible bugs')).toBe(true);
+    expect(isReviewIntent('review the auth module for security issues')).toBe(true);
+    expect(isReviewIntent('audit the codebase')).toBe(true);
+    expect(isReviewIntent('look for memory leaks')).toBe(true);
+    // build intent (edits)
+    expect(isReviewIntent('add a logout button')).toBe(false);
+    expect(isBuildIntent('add a logout button')).toBe(true);
+    expect(isBuildIntent('fix the off-by-one in repo.ts')).toBe(true);
+    expect(isBuildIntent('go over this project and find bugs')).toBe(false); // not a build verb
+  });
+
+  it('parses an explicit /analyze command as a read-only review', () => {
+    expect(parseCockpitOperatorCommand('/analyze find race conditions')).toEqual({ action: 'analyze', request: 'find race conditions' });
+    expect(parseCockpitOperatorCommand('audit the payment flow')).toEqual({ action: 'analyze', request: 'the payment flow' });
   });
 
   it('every palette command is understood by the operator/local command layer', () => {

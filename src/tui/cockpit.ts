@@ -67,6 +67,7 @@ export type CockpitOperatorCommand =
   | { action: 'find'; query: string }
   | { action: 'continue' }
   | { action: 'parallel'; mission: string }
+  | { action: 'analyze'; request: string }
   | { action: 'diff' | 'review' | 'status' | 'apply' | 'test' | 'fix' | 'discard' | 'undo'; runId?: string };
 
 
@@ -87,6 +88,27 @@ export function isActionableCodingMission(input: string): boolean {
   if (nonCodingOpeners.has(first)) return false;
   if (normalized.length < 6 && words.length < 2) return false;
   return missionActionVerbs.has(first) || words.length >= 3;
+}
+
+// Read-only review/analysis intent: inspect-and-report tasks (find bugs, audit, review, go over…)
+// that should run agents WITHOUT editing files — as opposed to build/fix tasks that mutate code.
+export function isReviewIntent(input: string): boolean {
+  const t = input.trim().toLowerCase().replace(/^[:/]/, '');
+  if (/\b(review|audit|analy[sz]e|inspect|examine|assess|scan)\b/.test(t)) return true;
+  if (/\bgo (over|through)\b/.test(t) || /\blook (for|over|through|into)\b/.test(t)) return true;
+  if (/\bfind\b[^.?!]*\b(bug|bugs|issue|issues|problem|problems|vulnerabilit|smell|smells|flaw|flaws|leak|leaks|regression)/.test(t)) return true;
+  if (/\bcheck\b[^.?!]*\bfor\b/.test(t)) return true;
+  return false;
+}
+
+// Clear build/change intent: tasks that should run the editing mission pipeline.
+const buildActionVerbs = new Set([
+  'add', 'build', 'create', 'make', 'implement', 'fix', 'repair', 'refactor', 'update', 'change',
+  'improve', 'write', 'generate', 'rename', 'remove', 'delete', 'migrate', 'optimize', 'integrate', 'wire',
+]);
+export function isBuildIntent(input: string): boolean {
+  const first = input.trim().toLowerCase().replace(/^[:/]/, '').split(/\s+/)[0] ?? '';
+  return buildActionVerbs.has(first);
 }
 
 export function parseCockpitMissionCommand(input: string): CockpitMissionCommand | undefined {
@@ -142,6 +164,7 @@ export function parseCockpitOperatorCommand(input: string): CockpitOperatorComma
   if (['ask', 'question', 'q'].includes(verb)) return body ? { action: 'ask', prompt: body } : undefined;
   if (['web', 'search-web'].includes(verb)) return body ? { action: 'web', query: body } : undefined;
   if (['find', 'file'].includes(verb)) return body ? { action: 'find', query: body } : undefined;
+  if (['analyze', 'analyse', 'audit'].includes(verb)) return body ? { action: 'analyze', request: body } : undefined;
   // "search …" is web when it mentions the web/internet, otherwise a file search.
   if (verb === 'search') return detectWebIntent(trimmed) ? { action: 'web', query: webQuery(trimmed) } : (body ? { action: 'find', query: body } : undefined);
   if (verb === 'continue') return { action: 'continue' };
@@ -602,6 +625,7 @@ export interface SlashCommand { name: string; arg: 'required' | 'optional' | 'no
 export const SLASH_COMMANDS: SlashCommand[] = [
   { name: 'ask', arg: 'required', desc: 'Ask a question — chat with the assistant' },
   { name: 'find', arg: 'required', desc: 'Find files by name/content in this folder' },
+  { name: 'analyze', arg: 'required', desc: 'Read-only codebase review with the agents (no edits)' },
   { name: 'web', arg: 'required', desc: 'Live web research with cited, labeled sources' },
   { name: 'plan', arg: 'required', desc: 'Plan a coding mission (no code changes)' },
   { name: 'code', arg: 'required', desc: 'Run a coding mission end-to-end' },
@@ -809,6 +833,9 @@ export interface CockpitController {
   // Re-read the latest run's live state (timeline/artifacts/phase) — polled while a mission runs so
   // the dashboard shows progress in real time instead of freezing until the mission returns.
   refreshState(): Promise<CockpitState>;
+  // Read-only multi-agent analysis: run each enabled agent over the codebase for `request` (no edits)
+  // and return their combined findings for the OUTPUT panel.
+  runReview(request: string, opts: { disabledAgents: string[] }): Promise<CockpitCommandResult>;
 }
 
 export interface CockpitSessionSummary { id: string; updatedAt: string; messages: number; last: string }
@@ -859,6 +886,7 @@ function describeCommand(command: CockpitOperatorCommand): string {
   if (command.action === 'plan') return `plan: ${command.mission}`;
   if (command.action === 'run') return `mission: ${command.mission}`;
   if (command.action === 'parallel') return `parallel: ${command.mission}`;
+  if (command.action === 'analyze') return `review: ${command.request}`;
   return command.action;
 }
 
@@ -867,6 +895,7 @@ function busyLabelFor(command: CockpitOperatorCommand): string {
   switch (command.action) {
     case 'ask': return 'asking the assistant';
     case 'web': return 'searching the web';
+    case 'analyze': return 'reviewing the code with the agents';
     case 'find': return 'searching files';
     case 'plan': return 'planning';
     case 'run': return 'running mission';
@@ -1059,7 +1088,6 @@ class VisualCockpit {
   private scroll = 0;
   private menuIndex = 0; // highlighted row in the slash-command palette
   private done = false;
-  private pendingMission: { command: CockpitOperatorCommand; text: string } | undefined; // awaiting y/N confirmation
   private state: CockpitState;
   private readonly conversation: ConversationEntry[];
   private summary: string;            // rolling summary of older turns
@@ -1182,7 +1210,6 @@ class VisualCockpit {
   private async handleKey(chunk: string): Promise<void> {
     if (matchesKey(chunk, 'ctrl+c')) { this.shutdown(); return; }
     if (this.busy) return; // ignore keystrokes while a command is running
-    if (this.pendingMission) { await this.resolvePendingMission(chunk); return; } // waiting on y/N confirm
 
     // Slash-command palette: while it's open, ↑/↓ move the selection, Tab completes, Enter runs the
     // highlighted command, and Esc closes it. Other keys fall through to normal editing (re-filtering).
@@ -1312,19 +1339,28 @@ class VisualCockpit {
     }
     // Cockpit-local commands (agent toggles, context, help) handled here without touching the controller.
     if (this.tryLocalCommand(text)) { this.prompt = ''; this.cursor = 0; this.renderToTerminal(); return; }
-    const command = parseCockpitOperatorCommand(text);
-    if (!command) { this.promptError = 'Type /plan <idea>, /code <idea>, /ask question, /continue, or /parallel <idea>'; this.renderToTerminal(); return; }
+    const parsed = parseCockpitOperatorCommand(text);
+    if (!parsed) { this.promptError = 'Type /plan <idea>, /code <idea>, /ask question, /continue, or /parallel <idea>'; this.renderToTerminal(); return; }
     this.prompt = '';
     this.cursor = 0;
     this.push({ author: 'you', text, mine: true });
-    // Plain prose that only *looks* like a coding mission: confirm before launching agents.
-    if ((command.action === 'run' || command.action === 'plan') && !isExplicitMissionCommand(text)) {
-      this.pendingMission = { command, text };
-      this.push({ author: 'system', text: `This looks like a coding mission: "${command.mission}". Press y to run the agents, or any other key to send it as a chat question instead.` });
-      this.renderToTerminal();
-      return;
-    }
+    // Smart auto-route: xdou decides what the request needs and runs it — no /code, no y/N. Explicit
+    // slash commands keep their exact meaning; only bare prose that parsed as a mission is reclassified.
+    const command = this.autoRoute(parsed, text);
+    if (command.action === 'analyze') this.push({ author: 'system', text: `Auto-detected a review task — running a read-only analysis with the agents (no file changes).` });
+    else if (command.action === 'run' && !isExplicitMissionCommand(text)) this.push({ author: 'system', text: `Auto-detected a build task — running the mission (edits code; Ctrl+C to stop).` });
     await this.dispatch(command);
+  }
+
+  // Reclassify bare prose that parsed as a coding mission into the right autonomous action: read-only
+  // analysis for review/find-bugs intent, the build pipeline for clear build verbs, otherwise fall
+  // back to chat (so an ambiguous sentence never silently launches file edits). Explicit /commands
+  // (and non-mission actions like ask/web/find/diff) pass through untouched.
+  private autoRoute(parsed: CockpitOperatorCommand, text: string): CockpitOperatorCommand {
+    if (parsed.action !== 'run' || isExplicitMissionCommand(text)) return parsed;
+    if (isReviewIntent(text)) return { action: 'analyze', request: text };
+    if (isBuildIntent(text)) return parsed; // clear build verb → mission pipeline (edits)
+    return { action: 'ask', prompt: text }; // ambiguous → answer in chat rather than auto-editing
   }
 
   // /sessions — list saved chat sessions in the OUTPUT panel so the operator can resume without
@@ -1402,20 +1438,6 @@ class VisualCockpit {
       this.push({ author: 'system', text: `Branched to new session ${id} from message ${idx} (kept ${newEntries.length} earlier). Original stays in /sessions.${editable ? ' Your message is in the input — edit and send.' : ''}` });
     } catch (error) {
       this.push({ author: 'system', text: `Could not branch: ${error instanceof Error ? error.message : String(error)}` });
-    }
-  }
-
-  // Resolve a confirmation for an auto-detected coding mission: 'y' runs the agents, anything else
-  // re-routes the original text to chat (/ask) instead.
-  private async resolvePendingMission(chunk: string): Promise<void> {
-    const pending = this.pendingMission;
-    this.pendingMission = undefined;
-    if (!pending) return;
-    if (chunk === 'y' || chunk === 'Y') {
-      await this.dispatch(pending.command);
-    } else {
-      this.push({ author: 'system', text: 'Sending it as a chat question instead.' });
-      await this.dispatch({ action: 'ask', prompt: pending.text });
     }
   }
 
@@ -1526,6 +1548,11 @@ class VisualCockpit {
         const result = await this.controller.runSuspended(command, { disabledAgents: [...this.disabledAgents] });
         this.state = result.state;
         this.push({ author: 'xdou', text: result.output.trim() || `${describeCommand(command)} complete — see artifacts.` });
+      } else if (command.action === 'analyze') {
+        // Read-only multi-agent codebase review — agents read & report, never edit.
+        const result = await this.controller.runReview(command.request, { disabledAgents: [...this.disabledAgents] });
+        this.state = result.state;
+        this.push({ author: result.author, text: result.output.trim() || '(no findings returned)' });
       } else {
         // Auto-compact: fold older turns into the summary before a chat call if the verbatim context
         // has grown past the threshold, so the assistant prompt stays bounded.

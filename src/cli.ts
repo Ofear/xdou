@@ -13,7 +13,7 @@ import { loadConfig } from './config/load.js';
 import { formatDuration, isActionableCodingMission, launchCockpit, readCockpitState, renderCockpitSnapshot, type CockpitController, type CockpitOperatorCommand, type ConversationEntry } from './tui/cockpit.js';
 import { deleteSession, isEmptySession, listSessions, newSessionId, pruneEmptySessions, readSession, writeSession } from './core/cockpit-sessions.js';
 import { filterTeam, teamRoster } from './core/cockpit-team.js';
-import { buildAssistantPrompt, buildSummaryPrompt, buildWebSearchPrompt, parseWebProvenance } from './core/assistant-prompt.js';
+import { buildAssistantPrompt, buildReviewPrompt, buildSummaryPrompt, buildWebSearchPrompt, parseWebProvenance } from './core/assistant-prompt.js';
 import { shouldAnswerAskLocally } from './core/ask-routing.js';
 import { isGitRepo, hasGitHead, isWorkingTreeClean, currentBranch } from './core/repo.js';
 import { selectAgents } from './agents/registry.js';
@@ -390,6 +390,27 @@ class Xdou extends Command {
       },
       // Live progress poll: re-read the latest run so the dashboard updates while a mission runs.
       refreshState: async () => readCockpitState(orchestrator.store),
+      // Read-only multi-agent codebase review: run each enabled agent in analyze mode (no edits) over
+      // the project and combine their findings. This is what an auto-detected "find bugs"/"review"
+      // request runs — the agents actually inspect the code, but nothing is changed.
+      runReview: async (request, opts) => {
+        const disabledSet = new Set(opts.disabledAgents);
+        const ids = teamRoster(team).map((agent) => agent.id).filter((id) => !disabledSet.has(id) && orchestrator.agents[id]);
+        const agents = selectAgents(ids, orchestrator.agents);
+        if (!agents.length) return { output: 'No agents enabled to review. Re-enable one with /enable <id>.', author: 'xdou', state: await refresh() };
+        const prompt = buildReviewPrompt(orchestrator.cwd, request);
+        const sections = await Promise.all(agents.map(async (agent) => {
+          try {
+            const result = await agent.run({ cwd: orchestrator.cwd, runDir: orchestrator.store.root, prompt, analyze: true });
+            const body = (result.ok ? result.stdout : result.stderr || result.stdout).trim() || '(no findings reported)';
+            return `## ${agent.id}${result.ok ? '' : ' (failed)'}\n\n${body}`;
+          } catch (error) {
+            return `## ${agent.id} (error)\n\n${error instanceof Error ? error.message : String(error)}`;
+          }
+        }));
+        const header = `Read-only review by ${agents.map((agent) => agent.id).join(' + ')} — no files were changed.`;
+        return { output: [header, ...sections].join('\n\n'), author: 'xdou', state: await refresh() };
+      },
       // Missions (plan/run/parallel/fix) drive the agent pipeline. Agents run with piped stdio, so we
       // capture their log output and hand it back for the OUTPUT panel — the cockpit stays on screen
       // with a live spinner rather than dropping to a blank terminal while the mission runs.

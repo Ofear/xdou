@@ -43,11 +43,15 @@ export class ClaudeCodeAdapter extends CliAgentAdapter {
     const maxTurns = role === 'reviewer' ? Math.min(this.maxTurns, 5) : this.maxTurns;
     // Web research: explicitly enable (only) the read-only web tools so the model can actually search
     // and cannot touch the filesystem. xdou controls the capability rather than hoping it's on.
+    // Analyze: read-only codebase review — allow file *reading* tools but no Write/Edit, so it can
+    // inspect the project and report findings without mutating anything.
     const toolArgs = input.web
       ? ['--allowedTools', 'WebSearch,WebFetch']
-      : isNonMutatingRole
-        ? ['--allowedTools', NON_MUTATING_ALLOWED_TOOLS]
-        : ['--permission-mode', 'bypassPermissions'];
+      : input.analyze
+        ? ['--allowedTools', 'Read,Grep,Glob,LS']
+        : isNonMutatingRole
+          ? ['--allowedTools', NON_MUTATING_ALLOWED_TOOLS]
+          : ['--permission-mode', 'bypassPermissions'];
     return { command: this.command, args: ['-p', input.prompt, '--max-turns', String(maxTurns), '--output-format', 'json', ...toolArgs], cwd: input.cwd, shell: false };
   }
 

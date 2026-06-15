@@ -14,7 +14,10 @@ export class CodexAdapter extends CliAgentAdapter {
 
   buildInvocation(input: AgentInput): AgentInvocation {
     const args = ['exec', '--cd', input.cwd, '-'];
-    if (this.fullAuto) args.splice(3, 0, '--dangerously-bypass-approvals-and-sandbox');
+    // Analyze: force a read-only sandbox so a codebase review can read files but never edit them.
+    // Otherwise honor fullAuto (bypass approvals/sandbox) for build/fix work.
+    if (input.analyze) args.splice(1, 0, '--sandbox', 'read-only');
+    else if (this.fullAuto) args.splice(3, 0, '--dangerously-bypass-approvals-and-sandbox');
     return { command: this.command, args, cwd: input.cwd, shell: false, stdin: input.prompt };
   }
 }
