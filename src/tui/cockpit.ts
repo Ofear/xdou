@@ -604,6 +604,7 @@ export const SLASH_COMMANDS: SlashCommand[] = [
   { name: 'clear', arg: 'none', desc: 'Clear context — agents start fresh' },
   { name: 'sessions', arg: 'none', desc: 'List saved chat sessions' },
   { name: 'resume', arg: 'required', desc: 'Resume a saved session — /resume <id>' },
+  { name: 'branch', arg: 'optional', desc: 'Fork a new session from a message — /branch [n]' },
 ];
 
 export function filterSlashCommands(filter: string): SlashCommand[] {
@@ -783,6 +784,9 @@ export interface CockpitController {
   // Load a saved session and re-point persistence at it. Returns its conversation, or undefined if
   // no such session exists. After this resolves, future persists write to the resumed session.
   resumeSession(id: string): Promise<CockpitResumeResult | undefined>;
+  // Create a NEW session seeded with the given (truncated) conversation and re-point persistence at
+  // it, leaving the original session untouched. Returns the new session id.
+  branchSession(seed: { entries: ConversationEntry[]; summary: string; summarizedCount: number }): Promise<{ id: string }>;
 }
 
 export interface CockpitSessionSummary { id: string; updatedAt: string; messages: number; last: string }
@@ -911,20 +915,20 @@ function renderOutputPanel(entries: ConversationEntry[], width: number, height: 
   const bodyH = Math.max(1, height - 2);
 
   const display: string[] = [];
-  for (const entry of entries) {
+  entries.forEach((entry, i) => {
     const color = entry.mine ? cyan : authorStyle(entry.author);
     const isSystem = !entry.mine && entry.author === 'system';
     // xdou tool output (diff/status/find/…) is preformatted — Markdown rendering would mangle a patch
     // (turning `-`/`#` lines into bullets/headings). Only real agent chat replies are Markdown.
     const isTool = !entry.mine && entry.author === 'xdou';
-    // Colored author label + a colored gutter bar down the message so each speaker is scannable.
-    display.push(`  ${color(bold(entry.mine ? `› ${entry.author}` : entry.author))}`);
+    // [n] index (for /branch <n>) + colored author label + a colored gutter bar down the message.
+    display.push(`  ${dim(`[${i + 1}]`)} ${color(bold(entry.mine ? `› ${entry.author}` : entry.author))}`);
     const bodyLines = entry.mine || isSystem || isTool
       ? wrapPlain(entry.text, innerWidth - 2).map((l) => (isSystem ? dim(l) : l))
       : renderMarkdownLines(entry.text, innerWidth - 2);
     for (const l of bodyLines) display.push(`  ${color('│')} ${l}`);
     display.push('');
-  }
+  });
   if (busyLabel) display.push(`  ${yellow(busyLabel)}`);
   if (!display.length) display.push(`  ${dim('Type a prompt below — replies appear here.')}`);
 
@@ -1201,12 +1205,14 @@ class VisualCockpit {
     const normalized = text.replace(/^\//, '');
     const [verb, ...restWords] = normalized.split(/\s+/);
     const lowerVerb = (verb ?? '').toLowerCase();
-    if (lowerVerb === 'sessions' || lowerVerb === 'resume') {
+    if (lowerVerb === 'sessions' || lowerVerb === 'resume' || lowerVerb === 'branch') {
       this.prompt = '';
       this.cursor = 0;
-      this.push({ author: 'you', text, mine: true });
-      if (lowerVerb === 'sessions') await this.showSessions();
-      else await this.resumeSessionById(restWords.join(' ').trim());
+      // Branch must not append the "/branch" line to the original session (it forks off the current
+      // transcript) — so it manages its own messaging. /sessions and /resume log a breadcrumb.
+      if (lowerVerb === 'sessions') { this.push({ author: 'you', text, mine: true }); await this.showSessions(); }
+      else if (lowerVerb === 'resume') { this.push({ author: 'you', text, mine: true }); await this.resumeSessionById(restWords.join(' ').trim()); }
+      else await this.branchFrom(restWords.join(' ').trim());
       this.renderToTerminal();
       return;
     }
@@ -1262,6 +1268,46 @@ class VisualCockpit {
       this.push({ author: 'system', text: `Resumed session ${resumed.id} — ${resumed.entries.length} earlier message(s) loaded.` });
     } catch (error) {
       this.push({ author: 'system', text: `Could not resume "${id}": ${error instanceof Error ? error.message : String(error)}` });
+    }
+  }
+
+  // /branch [n] — fork a NEW session from message n (1-based, as shown by the [n] markers), keeping
+  // messages 1..n-1. The original session is left intact and still resumable. If n is omitted, the
+  // last message you sent is used. The selected message's text is dropped into the input so you can
+  // edit and re-send it — a branch you can continue independently of the original.
+  private async branchFrom(arg: string): Promise<void> {
+    const total = this.conversation.length;
+    if (!total) { this.push({ author: 'system', text: 'Nothing to branch from yet.' }); return; }
+    let idx: number;
+    if (!arg) {
+      // last message authored by the operator
+      const fromEnd = [...this.conversation].reverse().findIndex((entry) => entry.mine);
+      if (fromEnd < 0) { this.push({ author: 'system', text: 'No message of yours to branch from. Use /branch <n> with a [n] marker.' }); return; }
+      idx = total - fromEnd;
+    } else {
+      const parsed = Number.parseInt(arg, 10);
+      if (!Number.isInteger(parsed) || parsed < 1 || parsed > total) {
+        this.push({ author: 'system', text: `Pick a message number between 1 and ${total} (see the [n] markers). Usage: /branch [n].` });
+        return;
+      }
+      idx = parsed;
+    }
+    const target = this.conversation[idx - 1];
+    const newEntries = this.conversation.slice(0, idx - 1).map((entry) => ({ ...entry }));
+    const newSummarizedCount = Math.min(this.summarizedCount, newEntries.length);
+    try {
+      const { id } = await this.controller.branchSession({ entries: newEntries, summary: this.summary, summarizedCount: newSummarizedCount });
+      // Swap the live cockpit onto the new branch. The original session keeps its full transcript.
+      this.conversation.length = 0;
+      this.conversation.push(...newEntries);
+      this.summarizedCount = newSummarizedCount;
+      this.sessionId = id;
+      this.scroll = 0;
+      const editable = target?.mine ?? false;
+      if (editable && target) { this.prompt = target.text; this.cursor = this.prompt.length; }
+      this.push({ author: 'system', text: `Branched to new session ${id} from message ${idx} (kept ${newEntries.length} earlier). Original stays in /sessions.${editable ? ' Your message is in the input — edit and send.' : ''}` });
+    } catch (error) {
+      this.push({ author: 'system', text: `Could not branch: ${error instanceof Error ? error.message : String(error)}` });
     }
   }
 

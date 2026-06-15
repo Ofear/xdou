@@ -373,6 +373,16 @@ class Xdou extends Command {
           summarizedCount: session.summarizedCount ?? 0,
         };
       },
+      // In-cockpit /branch: write the truncated transcript as a brand-new session and re-point
+      // persistence at it. The original session file is left untouched, so both remain resumable.
+      branchSession: async ({ entries, summary, summarizedCount }) => {
+        const id = newSessionId();
+        const now = new Date().toISOString();
+        await writeSession(orchestrator.store, { id, createdAt: now, updatedAt: now, entries: entries.map((entry) => ({ ...entry })), summary, summarizedCount });
+        sessionId = id;
+        createdAt = now;
+        return { id };
+      },
       // Missions (plan/run/parallel/fix) drive the agent pipeline. Agents run with piped stdio, so we
       // capture their log output and hand it back for the OUTPUT panel — the cockpit stays on screen
       // with a live spinner rather than dropping to a blank terminal while the mission runs.

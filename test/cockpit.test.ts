@@ -292,7 +292,7 @@ describe('slash command palette', () => {
   });
 
   it('every palette command is understood by the operator/local command layer', () => {
-    const local = new Set(['agents', 'enable', 'disable', 'clear', 'context', 'summarize', 'sessions', 'resume']);
+    const local = new Set(['agents', 'enable', 'disable', 'clear', 'context', 'summarize', 'sessions', 'resume', 'branch']);
     const mission = new Set(['plan', 'code', 'parallel']); // gate on isActionableCodingMission — need a real phrase
     for (const cmd of SLASH_COMMANDS) {
       if (local.has(cmd.name)) continue; // handled by tryLocalCommand/runSummary, not the operator parser
