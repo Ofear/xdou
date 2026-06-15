@@ -800,6 +800,7 @@ export interface ConversationEntry {
   author: string;   // 'you', 'claude', 'codex', 'xdou', 'system', …
   text: string;
   mine?: boolean;   // true for lines the operator typed
+  markdown?: boolean; // force Markdown rendering (e.g. review findings pushed under the 'xdou'-ish author)
 }
 
 export interface CockpitCommandResult {
@@ -865,6 +866,7 @@ function authorStyle(author: string): (s: string) => string {
   if (a.includes('claude')) return magenta;
   if (a.includes('codex')) return green;
   if (a.includes('gpt') || a.includes('openai') || a.includes('openrouter') || a.includes('opencode')) return yellow;
+  if (a === 'review') return cyan;
   if (a === 'system' || a.includes('xdou')) return blue;
   return bold;
 }
@@ -1018,11 +1020,14 @@ function renderOutputPanel(entries: ConversationEntry[], width: number, height: 
     // xdou tool output (diff/status/find/…) is preformatted — Markdown rendering would mangle a patch
     // (turning `-`/`#` lines into bullets/headings). Only real agent chat replies are Markdown.
     const isTool = !entry.mine && entry.author === 'xdou';
+    // Markdown for agent prose (and anything flagged markdown, e.g. review findings); plain for the
+    // operator's own lines, system notes, and preformatted tool output (diffs/status) that MD would mangle.
+    const useMarkdown = entry.markdown ?? (!entry.mine && !isSystem && !isTool);
     // [n] index (for /branch <n>) + colored author label + a colored gutter bar down the message.
     display.push(`  ${dim(`[${i + 1}]`)} ${color(bold(entry.mine ? `› ${entry.author}` : entry.author))}`);
-    const bodyLines = entry.mine || isSystem || isTool
-      ? wrapPlain(entry.text, innerWidth - 2).map((l) => (isSystem ? dim(l) : l))
-      : renderMarkdownLines(entry.text, innerWidth - 2);
+    const bodyLines = useMarkdown
+      ? renderMarkdownLines(entry.text, innerWidth - 2)
+      : wrapPlain(entry.text, innerWidth - 2).map((l) => (isSystem ? dim(l) : l));
     for (const l of bodyLines) display.push(`  ${color('│')} ${l}`);
     display.push('');
   });
@@ -1549,10 +1554,11 @@ class VisualCockpit {
         this.state = result.state;
         this.push({ author: 'xdou', text: result.output.trim() || `${describeCommand(command)} complete — see artifacts.` });
       } else if (command.action === 'analyze') {
-        // Read-only multi-agent codebase review — agents read & report, never edit.
+        // Read-only multi-agent codebase review — agents read & report, never edit. Findings are
+        // Markdown prose, so render them formatted (not as preformatted tool output).
         const result = await this.controller.runReview(command.request, { disabledAgents: [...this.disabledAgents] });
         this.state = result.state;
-        this.push({ author: result.author, text: result.output.trim() || '(no findings returned)' });
+        this.push({ author: 'review', text: result.output.trim() || '(no findings returned)', markdown: true });
       } else {
         // Auto-compact: fold older turns into the summary before a chat call if the verbatim context
         // has grown past the threshold, so the assistant prompt stays bounded.

@@ -59,12 +59,14 @@ export function buildReviewPrompt(cwd: string, request: string): string {
     '',
     'Rules:',
     '- READ-ONLY: inspect files with your read/search tools. Do NOT modify, create, or delete any files.',
-    '- Base every finding on code you actually read — cite file paths and line numbers. Do not speculate or invent issues.',
-    '- Report concrete, actionable findings. For each: what & where (file:line), why it is a problem, and a suggested fix.',
+    '- Base every finding on code you actually read. Do not speculate or invent issues.',
+    '- Cite locations as plain `relative/path.ts:line` (relative to the project root). Do NOT use markdown links, and do NOT print absolute paths — they are noise in a terminal.',
+    '- Report concrete, actionable findings. For each: the location, why it is a problem, and a suggested fix.',
     '- If you find nothing notable in an area, say so rather than padding.',
     '- This is a single synchronous turn: produce the complete findings now. Do not claim work is still running or that you will follow up later.',
     '',
-    'Format: a short summary line, then a markdown list of findings ordered by severity.',
+    'Format as a markdown list, ordered by severity. Keep it scannable: one finding per bullet, e.g.',
+    '- **High — short title** (`src/foo.ts:42`): what is wrong and why. Fix: the suggested change.',
   ].join('\n');
 }
 
