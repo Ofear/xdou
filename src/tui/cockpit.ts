@@ -560,31 +560,19 @@ function renderArtifactsColumn(state: CockpitState, width: number, height: numbe
   return lines.slice(0, height);
 }
 
-function renderActionsFooter(state: CockpitState, width: number): string[] {
+// Context-aware "what next" hint for the selected run. Command *discovery* now lives in the slash
+// palette (type /), so this surfaces only the few actions that make sense for the current run state,
+// as a single dim line — and nothing at all in the chat/empty state, where the palette covers it.
+function renderActionsFooter(state: CockpitState): string[] {
   const selected = state.selected;
-  let actions: string;
-
-  if (!selected) {
-    actions = '/ask <q>   /find <file>   /web <topic>   /plan <idea>   /code <idea>   ·   Ctrl+C quits';
-  } else if (selected.status === 'completed' && !selected.appliedAt) {
-    actions = '/diff view changes   /test run tests   /apply   /ask <q>   /code <new mission>   ·   Ctrl+C quits';
-  } else if (selected.status === 'blocked') {
-    actions = '/fix blockers   /discard   /diff view changes   /ask <q>   ·   Ctrl+C quits';
-  } else if (selected.status === 'running') {
-    actions = '/status refresh   /diff view changes   ·   Ctrl+C quits';
-  } else if (selected.appliedAt) {
-    actions = '/undo   /continue   /diff view changes   ·   Ctrl+C quits';
-  } else {
-    actions = '/plan <idea>   /code <idea>   /ask <q>   ·   Ctrl+C quits';
-  }
-
-  const contentWidth = width - 4;
-  return [
-    '',
-    `┌${'─'.repeat(contentWidth)}┐`,
-    pad(`  ${actions}`, contentWidth),
-    `└${'─'.repeat(contentWidth)}┘`,
-  ];
+  let next = '';
+  if (!selected) next = '';
+  else if (selected.status === 'completed' && !selected.appliedAt) next = '/diff · /test · /apply';
+  else if (selected.status === 'blocked') next = '/fix · /diff · /discard';
+  else if (selected.status === 'running') next = '/status · /diff';
+  else if (selected.appliedAt) next = '/undo · /continue · /diff';
+  if (!next) return [];
+  return ['', dim(`  next: ${next}`)];
 }
 
 // Single source of truth for the slash-command menu. `arg` controls what Enter does on a highlighted
@@ -687,10 +675,8 @@ function renderPromptComposer(width: number, activePrompt: string, promptError?:
     // Leave one cell for a trailing cursor block so it never overflows the box.
     for (const row of editableRows('Prompt: ', activePrompt, innerWidth - 1, cur)) lines.push(pad(`  ${row}`, contentWidth));
   } else {
-    lines.push(pad('  Prompt: /ask question | /find file | /web topic | /plan <idea> | /code <idea>', contentWidth));
-    lines.push(pad('  Tip: \\ then Enter = new line · ←/→/↑/↓ Home/End move · Enter sends', contentWidth));
+    lines.push(pad(`  ${dim('Type to chat · / for commands · \\ then Enter = newline')}`, contentWidth));
   }
-  lines.push(pad('  /ask /find /web do not require Git. /code and /run will initialize Git in a project folder.', contentWidth));
   lines.push(`└${'─'.repeat(contentWidth)}┘`);
   if (promptError) lines.push(red(`  ${promptError}`));
   if (footerMessage) lines.push(dim(`  ${footerMessage}`));
@@ -718,7 +704,7 @@ function emptyCockpitLines(width: number, activePrompt = ''): string[] {
       renderArtifactsColumn({ runs: [], selected: undefined, timeline: [], verdicts: [], artifacts: { plan: [], diff: [], review: [], summary: [] } }, rightW, colHeight),
       leftW, midW, rightW
     ),
-    ...renderActionsFooter({ runs: [], selected: undefined, timeline: [], verdicts: [], artifacts: { plan: [], diff: [], review: [], summary: [] } }, width),
+    ...renderActionsFooter({ runs: [], selected: undefined, timeline: [], verdicts: [], artifacts: { plan: [], diff: [], review: [], summary: [] } }),
     ...renderPromptComposer(width, activePrompt),
   ];
 }
@@ -753,7 +739,7 @@ export function renderCockpitSnapshot(state: CockpitState, width = 120, activePr
   lines.push('');
 
   // Actions footer
-  lines.push(...renderActionsFooter(state, totalWidth));
+  lines.push(...renderActionsFooter(state));
 
   // Prompt composer
   lines.push(...renderPromptComposer(totalWidth, activePrompt));
@@ -1391,7 +1377,7 @@ class VisualCockpit {
     const menu = this.menuItems();
     const footer = menu.length
       ? renderSlashMenu(menu, Math.max(0, Math.min(this.menuIndex, menu.length - 1)), totalWidth)
-      : renderActionsFooter(this.state, totalWidth);
+      : renderActionsFooter(this.state);
     const composer = renderPromptComposer(totalWidth, this.prompt, this.promptError, this.footerMessage, this.cursor);
 
     // Divide the remaining vertical space between the dashboard columns and the OUTPUT panel so the

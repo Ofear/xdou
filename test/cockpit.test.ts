@@ -71,13 +71,10 @@ describe('cockpit command', () => {
     expect(result.stdout).toContain('AGENTS');
     expect(result.stdout).toContain('TIMELINE (live)');
     expect(result.stdout).toContain('ARTIFACTS');
-    // Actions footer box (slash-command hints)
-    expect(result.stdout).toContain('/fix blockers');
-    expect(result.stdout).toContain('/discard');
-    expect(result.stdout).toContain('/diff view changes');
-    // Prompt composer box
-    expect(result.stdout).toContain('Prompt: /ask question');
-    expect(result.stdout).toContain('/ask /find /web do not require Git');
+    // Context-aware "next" hint for a blocked run (command discovery lives in the slash palette now)
+    expect(result.stdout).toContain('next: /fix · /diff · /discard');
+    // Prompt composer box — single decluttered hint
+    expect(result.stdout).toContain('/ for commands');
     // No old boxed panels
     expect(result.stdout).not.toContain('┌ Mission Tabs ');
     expect(result.stdout).not.toContain('┌ Current Focus ');
@@ -106,16 +103,11 @@ describe('cockpit command', () => {
     expect(result.stdout).toContain('ARTIFACTS');
     expect(result.stdout).toContain('plan.md');
     expect(result.stdout).toContain('(not created)');
-    // Actions footer (slash-command hints)
-    expect(result.stdout).toContain('/ask <q>');
-    expect(result.stdout).toContain('/find <file>');
-    expect(result.stdout).toContain('/web <topic>');
-    expect(result.stdout).toContain('/plan <idea>');
-    expect(result.stdout).toContain('/code <idea>');
-    expect(result.stdout).toContain('Ctrl+C quits');
-    // Prompt composer
-    expect(result.stdout).toContain('Prompt: /ask question');
-    expect(result.stdout).toContain('/ask /find /web do not require Git. /code and /run will initialize Git in a project folder.');
+    // Chat/empty state has no command-list clutter — discovery is via the slash palette (type /).
+    // The only persistent hint is the decluttered composer line.
+    expect(result.stdout).toContain('Type to chat · / for commands');
+    expect(result.stdout).not.toContain('/ask /find /web do not require Git');
+    expect(result.stdout).not.toContain('Tip: \\ then Enter');
     // No old boxed panels
     expect(result.stdout).not.toContain('┌ Mission Tabs ');
     expect(result.stdout).not.toContain('┌ Current Focus ');
@@ -195,7 +187,6 @@ describe('cockpit command', () => {
   it('shows typed prompt text in the visible composer instead of hiding it in an overlay', () => {
     const output = renderCockpitSnapshot({ runs: [], selected: undefined, timeline: [], verdicts: [], artifacts: { plan: [], diff: [], review: [], summary: [] } }, 120, 'plan test cockpit prompt');
     expect(output).toContain('Prompt: plan test cockpit prompt');
-    expect(output).toContain('/ask /find /web do not require Git. /code and /run will initialize Git in a project folder.');
   });
 
   it('keeps snapshot lines within the requested wide terminal width', () => {
