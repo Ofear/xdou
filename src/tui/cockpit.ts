@@ -602,6 +602,8 @@ export const SLASH_COMMANDS: SlashCommand[] = [
   { name: 'context', arg: 'none', desc: 'Show chat context size & summary' },
   { name: 'summarize', arg: 'none', desc: 'Compact the conversation now' },
   { name: 'clear', arg: 'none', desc: 'Clear context — agents start fresh' },
+  { name: 'sessions', arg: 'none', desc: 'List saved chat sessions' },
+  { name: 'resume', arg: 'required', desc: 'Resume a saved session — /resume <id>' },
 ];
 
 export function filterSlashCommands(filter: string): SlashCommand[] {
@@ -776,7 +778,15 @@ export interface CockpitController {
   runSuspended(command: CockpitOperatorCommand, opts: { disabledAgents: string[] }): Promise<CockpitCommandResult>;
   // Compress the conversation into a compact summary (context compaction).
   summarize(opts: { priorSummary: string; turns: ConversationEntry[] }): Promise<{ summary: string }>;
+  // List saved chat sessions for the in-cockpit /sessions browser.
+  listSessions(): Promise<CockpitSessionSummary[]>;
+  // Load a saved session and re-point persistence at it. Returns its conversation, or undefined if
+  // no such session exists. After this resolves, future persists write to the resumed session.
+  resumeSession(id: string): Promise<CockpitResumeResult | undefined>;
 }
+
+export interface CockpitSessionSummary { id: string; updatedAt: string; messages: number; last: string }
+export interface CockpitResumeResult { id: string; entries: ConversationEntry[]; summary: string; summarizedCount: number }
 
 export interface CockpitPersistSnapshot {
   entries: ConversationEntry[];
@@ -982,7 +992,7 @@ class VisualCockpit {
   private summarizedCount: number;    // leading entries folded into `summary`
   private readonly disabledAgents = new Set<string>(); // roster agents the operator has turned off
   private readonly roster: CockpitRosterAgent[];
-  private readonly sessionId: string | undefined;
+  private sessionId: string | undefined; // mutable: /resume switches the active session live
   private readonly cwd: string;
   private readonly branch: string | undefined;
   private readonly onPersist: ((snapshot: CockpitPersistSnapshot) => void) | undefined;
@@ -1187,6 +1197,19 @@ class VisualCockpit {
       try { await this.runSummary(false); } finally { this.stopSpinner(); this.renderToTerminal(); }
       return;
     }
+    // Session browsing/switching (async, needs the controller's store access).
+    const normalized = text.replace(/^\//, '');
+    const [verb, ...restWords] = normalized.split(/\s+/);
+    const lowerVerb = (verb ?? '').toLowerCase();
+    if (lowerVerb === 'sessions' || lowerVerb === 'resume') {
+      this.prompt = '';
+      this.cursor = 0;
+      this.push({ author: 'you', text, mine: true });
+      if (lowerVerb === 'sessions') await this.showSessions();
+      else await this.resumeSessionById(restWords.join(' ').trim());
+      this.renderToTerminal();
+      return;
+    }
     // Cockpit-local commands (agent toggles, context, help) handled here without touching the controller.
     if (this.tryLocalCommand(text)) { this.prompt = ''; this.cursor = 0; this.renderToTerminal(); return; }
     const command = parseCockpitOperatorCommand(text);
@@ -1202,6 +1225,44 @@ class VisualCockpit {
       return;
     }
     await this.dispatch(command);
+  }
+
+  // /sessions — list saved chat sessions in the OUTPUT panel so the operator can resume without
+  // leaving the cockpit.
+  private async showSessions(): Promise<void> {
+    try {
+      const sessions = await this.controller.listSessions();
+      if (!sessions.length) { this.push({ author: 'system', text: 'No saved sessions yet.' }); return; }
+      const lines = sessions.map((s) => {
+        const here = s.id === this.sessionId ? ' (current)' : '';
+        const last = s.last.replace(/\s+/g, ' ').slice(0, 48);
+        return `${s.id}${here}  ·  ${s.messages} msg  ·  ${last}`;
+      });
+      this.push({ author: 'system', text: ['Saved sessions — switch with /resume <id>:', ...lines].join('\n') });
+    } catch (error) {
+      this.push({ author: 'system', text: `Could not list sessions: ${error instanceof Error ? error.message : String(error)}` });
+    }
+  }
+
+  // /resume <id> — swap the running cockpit onto another saved session: load its transcript/summary
+  // and re-point persistence at it (handled controller-side), no restart needed.
+  private async resumeSessionById(id: string): Promise<void> {
+    if (!id) { this.push({ author: 'system', text: 'Usage: /resume <session-id> — see /sessions for ids.' }); return; }
+    if (id === this.sessionId) { this.push({ author: 'system', text: `Already in session ${id}.` }); return; }
+    try {
+      const resumed = await this.controller.resumeSession(id);
+      if (!resumed) { this.push({ author: 'system', text: `Session "${id}" not found. See /sessions.` }); return; }
+      this.conversation.length = 0;
+      this.conversation.push(...resumed.entries);
+      this.summary = resumed.summary;
+      this.summarizedCount = Math.min(resumed.summarizedCount, this.conversation.length);
+      this.sessionId = resumed.id;
+      this.scroll = 0;
+      // Persisted to the now-active session; the title bar updates to show the new id.
+      this.push({ author: 'system', text: `Resumed session ${resumed.id} — ${resumed.entries.length} earlier message(s) loaded.` });
+    } catch (error) {
+      this.push({ author: 'system', text: `Could not resume "${id}": ${error instanceof Error ? error.message : String(error)}` });
+    }
   }
 
   // Resolve a confirmation for an auto-detected coding mission: 'y' runs the agents, anything else

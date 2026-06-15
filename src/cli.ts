@@ -314,8 +314,9 @@ class Xdou extends Command {
     // Resume a prior chat or start a fresh session, persisting every conversation entry.
     const existing = sessionFlag ? await readSession(orchestrator.store, sessionFlag) : undefined;
     if (sessionFlag && !existing) throw new Error(`Session "${sessionFlag}" not found. See: xdou sessions list`);
-    const sessionId = existing?.id ?? newSessionId();
-    const createdAt = existing?.createdAt ?? new Date().toISOString();
+    // Mutable: /resume inside the cockpit re-points these so persistence follows the resumed session.
+    let sessionId = existing?.id ?? newSessionId();
+    let createdAt = existing?.createdAt ?? new Date().toISOString();
     const history: ConversationEntry[] = existing?.entries ?? [];
     const startSummary = existing?.summary ?? '';
     const startSummarizedCount = existing?.summarizedCount ?? 0;
@@ -347,6 +348,30 @@ class Xdou extends Command {
         if (!agent) return { summary: priorSummary };
         const result = await agent.run({ cwd: orchestrator.cwd, runDir: orchestrator.store.root, prompt: buildSummaryPrompt(priorSummary, turns) });
         return { summary: result.ok && result.stdout.trim() ? result.stdout.trim() : priorSummary };
+      },
+      // In-cockpit /sessions browser: summarize each saved session for display.
+      listSessions: async () => {
+        const all = await listSessions(orchestrator.store);
+        return all.map((s) => ({
+          id: s.id,
+          updatedAt: s.updatedAt,
+          messages: s.entries.length,
+          last: [...s.entries].reverse().find((entry) => !entry.mine)?.text ?? s.entries.at(-1)?.text ?? '',
+        }));
+      },
+      // In-cockpit /resume <id>: load a saved session and re-point persistence at it so subsequent
+      // writes (and the session-saved line on exit) follow the resumed session, not the original.
+      resumeSession: async (id) => {
+        const session = await readSession(orchestrator.store, id);
+        if (!session) return undefined;
+        sessionId = session.id;
+        createdAt = session.createdAt;
+        return {
+          id: session.id,
+          entries: session.entries.map((entry) => ({ ...entry })),
+          summary: session.summary ?? '',
+          summarizedCount: session.summarizedCount ?? 0,
+        };
       },
       // Missions (plan/run/parallel/fix) drive the agent pipeline. Agents run with piped stdio, so we
       // capture their log output and hand it back for the OUTPUT panel — the cockpit stays on screen
