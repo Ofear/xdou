@@ -348,18 +348,22 @@ class Xdou extends Command {
         const result = await agent.run({ cwd: orchestrator.cwd, runDir: orchestrator.store.root, prompt: buildSummaryPrompt(priorSummary, turns) });
         return { summary: result.ok && result.stdout.trim() ? result.stdout.trim() : priorSummary };
       },
-      // Missions/fix stream lots of output and may prompt for a project folder — the cockpit has
-      // already dropped the alt screen, so let them render to the real terminal directly.
+      // Missions (plan/run/parallel/fix) drive the agent pipeline. Agents run with piped stdio, so we
+      // capture their log output and hand it back for the OUTPUT panel — the cockpit stays on screen
+      // with a live spinner rather than dropping to a blank terminal while the mission runs.
       runSuspended: async (command, opts) => {
         const effectiveTeam = filterTeam(team, opts.disabledAgents);
         const disabledSet = new Set(opts.disabledAgents);
         const enabledRoster = teamRoster(team).map((agent) => agent.id).filter((id) => !disabledSet.has(id));
-        let output = '';
-        if (command.action === 'parallel') output = await this.runParallelMission(orchestrator, command.mission, enabledRoster, maxFixAttempts);
-        else if (command.action === 'plan') await this.plan(orchestrator, [command.mission], effectiveTeam, agentsFlag);
-        else if (command.action === 'run') await this.runMission(orchestrator, [command.mission], effectiveTeam, agentsFlag, maxFixAttempts, json);
-        else await this.handleCockpitOperatorCommand(orchestrator, command, effectiveTeam, json);
+        let parallelSummary = '';
+        const captured = await this.captureLog(async () => {
+          if (command.action === 'parallel') parallelSummary = await this.runParallelMission(orchestrator, command.mission, enabledRoster, maxFixAttempts);
+          else if (command.action === 'plan') await this.plan(orchestrator, [command.mission], effectiveTeam, agentsFlag);
+          else if (command.action === 'run') await this.runMission(orchestrator, [command.mission], effectiveTeam, agentsFlag, maxFixAttempts, json);
+          else await this.handleCockpitOperatorCommand(orchestrator, command, effectiveTeam, json);
+        });
         selectedRunId = (await orchestrator.store.latestRunId()) ?? selectedRunId;
+        const output = [parallelSummary, captured].filter((part) => part.trim()).join('\n');
         return { output, author: 'xdou', state: await refresh() };
       },
     };

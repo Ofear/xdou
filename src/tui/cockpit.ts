@@ -6,6 +6,7 @@ import stripAnsi from 'strip-ansi';
 import type { ArtifactStore } from '../core/artifact-store.js';
 import { readCollaborationState, type CollaborationEvent, type CollaborationState } from '../core/live-collaboration.js';
 import { CONTEXT_CHAR_BUDGET, turnChars } from '../core/assistant-prompt.js';
+import { killInFlightAgents } from '../agents/base.js';
 import type { RunManifest } from '../types.js';
 
 // Verbatim conversation past this many characters triggers an automatic summary fold-in before the
@@ -805,7 +806,9 @@ function authorStyle(author: string): (s: string) => string {
   return bold;
 }
 
-function commandSuspends(command: CockpitOperatorCommand): boolean {
+// Commands that drive the agent pipeline (vs. quick chat/tool replies). They run inline behind the
+// spinner — they can be slow, but agents use piped stdio so the dashboard never needs to be dropped.
+function isMissionCommand(command: CockpitOperatorCommand): boolean {
   return command.action === 'plan' || command.action === 'run' || command.action === 'fix' || command.action === 'parallel';
 }
 
@@ -972,7 +975,6 @@ class VisualCockpit {
   private scroll = 0;
   private menuIndex = 0; // highlighted row in the slash-command palette
   private done = false;
-  private suspended = false; // alt screen dropped for a streaming mission — never paint over it
   private pendingMission: { command: CockpitOperatorCommand; text: string } | undefined; // awaiting y/N confirmation
   private state: CockpitState;
   private readonly conversation: ConversationEntry[];
@@ -1309,23 +1311,17 @@ class VisualCockpit {
   private async dispatch(command: CockpitOperatorCommand): Promise<void> {
     this.footerMessage = '';
     this.scroll = 0;
+    this.startSpinner();
     try {
-      if (commandSuspends(command)) {
-        // Suspended work prints to the real terminal — no spinner timer (it would corrupt that output).
-        this.busy = true;
-        this.renderToTerminal();
-        this.push({ author: 'system', text: `Running ${describeCommand(command)} — live output below…` });
-        this.suspendScreen();
-        let result: CockpitCommandResult;
-        try {
-          result = await this.controller.runSuspended(command, { disabledAgents: [...this.disabledAgents] });
-        } finally {
-          this.resumeScreen();
-        }
+      if (isMissionCommand(command)) {
+        // Missions can take minutes, but agents always run with piped (non-TTY) stdio — nothing needs
+        // the terminal. So we run them INLINE behind the live spinner instead of dropping the alt
+        // screen: the dashboard stays visible and responsive, and the result lands in the OUTPUT panel.
+        this.push({ author: 'system', text: `Running ${describeCommand(command)} — agents are working; this can take a while. Output appears here when done.` });
+        const result = await this.controller.runSuspended(command, { disabledAgents: [...this.disabledAgents] });
         this.state = result.state;
-        this.push({ author: 'system', text: result.output.trim() || `${describeCommand(command)} complete — see output above.` });
+        this.push({ author: 'xdou', text: result.output.trim() || `${describeCommand(command)} complete — see artifacts.` });
       } else {
-        this.startSpinner();
         // Auto-compact: fold older turns into the summary before a chat call if the verbatim context
         // has grown past the threshold, so the assistant prompt stays bounded.
         if ((command.action === 'ask' || command.action === 'web') && this.contextChars() > AUTO_SUMMARIZE_CHARS) {
@@ -1343,25 +1339,6 @@ class VisualCockpit {
       this.scroll = 0;
       this.renderToTerminal();
     }
-  }
-
-  private suspendScreen(): void {
-    this.suspended = true;
-    this.stdout.off('resize', this.resizeHandler);
-    this.stdin.off('data', this.inputHandler);
-    if (this.stdin.setRawMode) this.stdin.setRawMode(false);
-    this.stdin.pause();
-    // Leave the alternate screen + show the cursor so streamed output and readline prompts work.
-    this.stdout.write('\x1b[?1049l\x1b[?25h');
-  }
-
-  private resumeScreen(): void {
-    this.suspended = false;
-    if (this.stdin.setRawMode) this.stdin.setRawMode(true);
-    this.stdin.resume();
-    this.stdin.on('data', this.inputHandler);
-    this.stdout.on('resize', this.resizeHandler);
-    this.stdout.write('\x1b[?1049h\x1b[?25l');
   }
 
   private renderFrame(width: number, height: number): string[] {
@@ -1412,7 +1389,7 @@ class VisualCockpit {
   }
 
   private renderToTerminal(): void {
-    if (this.done || this.suspended) return; // never paint over a streaming mission's terminal output
+    if (this.done) return; // stop painting once the cockpit has shut down
     const width = this.stdout.columns || Number(process.env.COLUMNS) || 120;
     const height = this.stdout.rows || Number(process.env.LINES) || 30;
     // Cap to height-1 ROWS and clamp every line to the terminal width. A line wider than the
@@ -1430,6 +1407,9 @@ class VisualCockpit {
   private shutdown(): void {
     if (this.done) return;
     this.done = true;
+    // Ctrl+C may land mid-mission. Kill any in-flight agent subprocesses so their promises settle and
+    // the process can actually exit — otherwise node lingers in the background until agents finish.
+    killInFlightAgents();
     this.stopSpinner(); // clear the render timer so the event loop can exit
     this.stdin.off('data', this.inputHandler);
     this.stdout.off('resize', this.resizeHandler);
