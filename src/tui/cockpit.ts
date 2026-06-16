@@ -1073,7 +1073,7 @@ function renderOutputPanel(entries: ConversationEntry[], width: number, height: 
   while (windowLines.length < bodyH) windowLines.push('');
 
   const title = focused
-    ? ` ▸ OUTPUT · ↑↓ scroll · c copy · Tab/Esc exit${maxScroll > 0 ? ` (${maxScroll - clamped} above)` : ''} `
+    ? ` ▸ OUTPUT · ↑↓ scroll · y copy answer · Y copy all · c view · Tab/Esc exit${maxScroll > 0 ? ` (${maxScroll - clamped} above)` : ''} `
     : busyLabel
       ? ` OUTPUT · ${busyLabel} `
       : maxScroll > 0 ? ` OUTPUT · ↑↓/PgUp/PgDn (${maxScroll - clamped} above) ` : ' OUTPUT ';
@@ -1277,7 +1277,7 @@ class VisualCockpit {
 
     // When focus is on a non-prompt zone, its keys drive that zone. A printable key snaps focus back
     // to the prompt and is then typed (so you never get stranded away from the input).
-    if (this.focus === 'output' && this.handleOutputKey(chunk)) return;
+    if (this.focus === 'output' && await this.handleOutputKey(chunk)) return;
     if (this.focus === 'agents' && this.handleAgentsKey(chunk)) return;
     if (this.focus === 'artifacts' && await this.handleArtifactsKey(chunk)) return;
 
@@ -1321,17 +1321,43 @@ class VisualCockpit {
     this.renderToTerminal();
   }
 
-  // OUTPUT focus: arrows/PgUp/PgDn scroll the transcript (higher scroll = older). Esc/Enter return to
-  // the prompt; a printable key returns to the prompt and is typed there. Returns false to fall through.
-  private handleOutputKey(chunk: string): boolean {
+  // OUTPUT focus: arrows/PgUp/PgDn scroll; y/Y copy to clipboard (no manual selection needed); c opens
+  // the native copy view. Esc/Enter return to the prompt; a printable key returns and is typed there.
+  private async handleOutputKey(chunk: string): Promise<boolean> {
     if (chunk === '\x1b[A' || chunk === '\x1bOA') { this.scroll += 1; this.renderToTerminal(); return true; }
     if (chunk === '\x1b[B' || chunk === '\x1bOB') { this.scroll = Math.max(0, this.scroll - 1); this.renderToTerminal(); return true; }
     if (chunk === '\x1b[5~') { this.scroll += 5; this.renderToTerminal(); return true; }
     if (chunk === '\x1b[6~') { this.scroll = Math.max(0, this.scroll - 5); this.renderToTerminal(); return true; }
-    if (chunk === 'c' || chunk === 'C') { this.enterCopyView(); return true; } // native select/copy
+    if (chunk === 'y') { await this.yank('answer'); this.renderToTerminal(); return true; }  // copy latest answer
+    if (chunk === 'Y') { await this.yank('all'); this.renderToTerminal(); return true; }     // copy whole transcript
+    if (chunk === 'c' || chunk === 'C') { this.enterCopyView(); return true; }               // visual native-select view
     if (matchesKey(chunk, 'escape') || matchesKey(chunk, 'enter') || chunk === '\r' || chunk === '\n') { this.focus = 'prompt'; this.renderToTerminal(); return true; }
     if (/^[\x20-\x7E]+$/.test(chunk)) { this.focus = 'prompt'; return false; } // snap to prompt, then type
     return true; // swallow other control keys
+  }
+
+  // Write text to the system clipboard via the OSC-52 escape (works without leaving the alt screen and
+  // without any manual selection). Terminals/multiplexers that block OSC-52 simply ignore it — which is
+  // why yank() always also saves a file the operator can open.
+  private osc52Copy(text: string): void {
+    const encoded = Buffer.from(text, 'utf8').toString('base64');
+    this.stdout.write(`\x1b]52;c;${encoded}\x07`);
+  }
+
+  // Copy without selecting: 'answer' = the latest agent/tool reply, 'all' = the whole transcript.
+  private async yank(scope: 'answer' | 'all'): Promise<void> {
+    const text = scope === 'all'
+      ? this.conversation.map((entry) => `### ${entry.mine ? 'you' : entry.author}\n${entry.text}`).join('\n\n')
+      : ([...this.conversation].reverse().find((entry) => !entry.mine && entry.author !== 'system')?.text ?? '');
+    if (!text.trim()) { this.push({ author: 'system', text: 'Nothing to copy yet.' }); return; }
+    this.osc52Copy(text);
+    let savedPath = '';
+    try {
+      savedPath = join(this.cwd, '.xdou', `transcript-${this.sessionId ?? 'session'}.txt`);
+      await fs.outputFile(savedPath, text, 'utf8');
+    } catch { savedPath = ''; }
+    this.push({ author: 'system', text: `✓ Sent ${scope === 'all' ? 'full transcript' : 'latest answer'} (${text.length} chars) to the clipboard via OSC-52.${savedPath ? ` Also saved to ${savedPath} — open it if paste doesn't work (some terminals/tmux block clipboard escapes).` : ''}` });
+    this.focus = 'prompt';
   }
 
   // Drop the alternate screen and print the whole transcript to the normal buffer, where the terminal's
