@@ -389,16 +389,27 @@ function agentsFromState(state: CockpitState): AgentCard[] {
   return [...seen.values()].slice(0, 8);
 }
 
-function artifactLines(state: CockpitState): string[] {
-  const sections: Array<[string, string[]]> = [
-    ['plan.md', state.artifacts.plan],
-    ['diff.patch', state.artifacts.diff],
-    ['review.md', state.artifacts.review],
-    ['final-summary.md', state.artifacts.summary],
-  ];
+// The viewable run artifacts, in display order. `markdown` controls how the full file renders when
+// opened (plan/review/summary are prose; diff is a preformatted patch).
+interface ArtifactDesc { key: 'plan' | 'diff' | 'review' | 'summary'; file: string; markdown: boolean }
+const ARTIFACTS: ArtifactDesc[] = [
+  { key: 'plan', file: 'plan.md', markdown: true },
+  { key: 'diff', file: 'diff.patch', markdown: false },
+  { key: 'review', file: 'review.md', markdown: true },
+  { key: 'summary', file: 'final-summary.md', markdown: true },
+];
+
+// Artifacts that actually exist for the selected run (non-empty preview) — the ones you can select & open.
+function focusableArtifacts(state: CockpitState): ArtifactDesc[] {
+  return ARTIFACTS.filter((artifact) => state.artifacts[artifact.key].length > 0);
+}
+
+function artifactLines(state: CockpitState, selectedKey?: string): string[] {
   const out: string[] = [];
-  for (const [name, lines] of sections) {
-    out.push(`${yellow(name)}`);
+  for (const { key, file } of ARTIFACTS) {
+    const lines = state.artifacts[key];
+    const marker = key === selectedKey ? `${cyan('▸')} ` : '';
+    out.push(`${marker}${yellow(file)}`);
     out.push(...(lines.length ? lines : [dim('(not created)')]).slice(0, 5));
     out.push('');
   }
@@ -597,9 +608,10 @@ function renderTimelineColumn(state: CockpitState, width: number, height: number
   return lines.slice(0, height);
 }
 
-function renderArtifactsColumn(state: CockpitState, width: number, height: number): string[] {
-  const lines: string[] = [bold('ARTIFACTS')];
-  const artifacts = artifactLines(state);
+function renderArtifactsColumn(state: CockpitState, width: number, height: number, focused = false, selectedKey?: string): string[] {
+  const header = focused ? `${inverse(' ARTIFACTS ')}  ${dim('↑↓ · Enter opens')}` : bold('ARTIFACTS');
+  const lines: string[] = [header];
+  const artifacts = artifactLines(state, selectedKey);
   for (const line of artifacts.slice(0, height - 4)) {
     lines.push(`  ${line}`);
   }
@@ -1113,8 +1125,9 @@ class VisualCockpit {
   private scroll = 0;
   private menuIndex = 0; // highlighted row in the slash-command palette
   private missionInFocus = false; // is the dashboard showing a run as the *current* focus (vs. neutral)?
-  private focus: 'prompt' | 'output' | 'agents' = 'prompt'; // Tab-cycled keyboard focus zone
+  private focus: 'prompt' | 'output' | 'agents' | 'artifacts' = 'prompt'; // Tab-cycled keyboard focus zone
   private agentCursor = 0; // selected row in the AGENTS panel when it has focus
+  private artifactCursor = 0; // selected artifact in the ARTIFACTS panel when it has focus
   private done = false;
   private state: CockpitState;
   private readonly conversation: ConversationEntry[];
@@ -1262,6 +1275,7 @@ class VisualCockpit {
     // to the prompt and is then typed (so you never get stranded away from the input).
     if (this.focus === 'output' && this.handleOutputKey(chunk)) return;
     if (this.focus === 'agents' && this.handleAgentsKey(chunk)) return;
+    if (this.focus === 'artifacts' && await this.handleArtifactsKey(chunk)) return;
 
     // PgUp/PgDn scroll the OUTPUT panel. (Arrow/page escapes contain \x1b so they never match the
     // printable-character test used for prompt typing.)
@@ -1286,12 +1300,20 @@ class VisualCockpit {
     await this.handlePromptInput(chunk);
   }
 
-  // Cycle focus across the interactive zones. AGENTS is only a zone when a roster is configured.
+  // Cycle focus across the interactive zones. AGENTS exists only with a roster; ARTIFACTS only when a
+  // focused run actually has artifacts to open.
   private cycleFocus(dir: 1 | -1): void {
-    const zones: Array<'prompt' | 'agents' | 'output'> = ['prompt', ...(this.roster.length ? ['agents' as const] : []), 'output'];
+    const hasArtifacts = this.missionInFocus && focusableArtifacts(this.state).length > 0;
+    const zones: Array<typeof this.focus> = [
+      'prompt',
+      ...(this.roster.length ? ['agents' as const] : []),
+      ...(hasArtifacts ? ['artifacts' as const] : []),
+      'output',
+    ];
     const index = zones.indexOf(this.focus);
     this.focus = zones[(index + dir + zones.length) % zones.length] ?? 'prompt';
     if (this.focus === 'agents') this.agentCursor = Math.max(0, Math.min(this.agentCursor, this.roster.length - 1));
+    if (this.focus === 'artifacts') this.artifactCursor = Math.max(0, Math.min(this.artifactCursor, focusableArtifacts(this.state).length - 1));
     this.renderToTerminal();
   }
 
@@ -1323,6 +1345,37 @@ class VisualCockpit {
     if (matchesKey(chunk, 'escape')) { this.focus = 'prompt'; this.renderToTerminal(); return true; }
     if (/^[\x20-\x7E]+$/.test(chunk)) { this.focus = 'prompt'; return false; }
     return true;
+  }
+
+  // ARTIFACTS focus: arrows pick an artifact, Enter opens its full contents in the OUTPUT panel.
+  private async handleArtifactsKey(chunk: string): Promise<boolean> {
+    const arts = focusableArtifacts(this.state);
+    if (!arts.length) { this.focus = 'prompt'; return false; }
+    this.artifactCursor = Math.min(this.artifactCursor, arts.length - 1);
+    if (chunk === '\x1b[A' || chunk === '\x1bOA') { this.artifactCursor = (this.artifactCursor - 1 + arts.length) % arts.length; this.renderToTerminal(); return true; }
+    if (chunk === '\x1b[B' || chunk === '\x1bOB') { this.artifactCursor = (this.artifactCursor + 1) % arts.length; this.renderToTerminal(); return true; }
+    if (matchesKey(chunk, 'enter') || chunk === '\r' || chunk === '\n') { const art = arts[this.artifactCursor]; if (art) await this.viewArtifact(art); return true; }
+    if (matchesKey(chunk, 'escape')) { this.focus = 'prompt'; this.renderToTerminal(); return true; }
+    if (/^[\x20-\x7E]+$/.test(chunk)) { this.focus = 'prompt'; return false; }
+    return true;
+  }
+
+  // Read a run artifact off disk and show its full contents in the OUTPUT panel, then return focus to
+  // the prompt so the operator can read/scroll it.
+  private async viewArtifact(desc: ArtifactDesc): Promise<void> {
+    const dir = this.state.selected?.artifactDir;
+    if (!dir) { this.push({ author: 'system', text: 'No run selected to read artifacts from.' }); return; }
+    try {
+      const raw = await fs.readFile(join(dir, desc.file), 'utf8');
+      const trimmed = raw.trim();
+      const body = trimmed ? (trimmed.length > 8000 ? `${trimmed.slice(0, 8000)}\n\n… (truncated — full file at ${join(dir, desc.file)})` : trimmed) : '(file is empty)';
+      this.push({ author: 'xdou', text: `📄 ${desc.file}\n\n${body}`, markdown: desc.markdown });
+    } catch (error) {
+      this.push({ author: 'system', text: `Could not read ${desc.file}: ${error instanceof Error ? error.message : String(error)}` });
+    }
+    this.scroll = 0;
+    this.focus = 'prompt';
+    this.renderToTerminal();
   }
 
   // Up/Down move the cursor between input lines, or scroll the OUTPUT panel once the cursor is at the
@@ -1709,7 +1762,7 @@ class VisualCockpit {
       ...threeColumn(
         agentsCol,
         renderTimelineColumn(viewState, midW, colHeight),
-        renderArtifactsColumn(viewState, rightW, colHeight),
+        renderArtifactsColumn(viewState, rightW, colHeight, this.focus === 'artifacts', this.focus === 'artifacts' ? focusableArtifacts(viewState)[this.artifactCursor]?.key : undefined),
         leftW, midW, rightW,
       ),
       ...renderOutputPanel(this.conversation, totalWidth, outHeight, this.scroll, this.busyLabel(), this.focus === 'output'),
