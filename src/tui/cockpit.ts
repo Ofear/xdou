@@ -558,18 +558,22 @@ function renderAgentsColumn(agents: AgentCard[], width: number, height: number):
 }
 
 // The toggleable roster: each agent shows a checkbox reflecting whether it participates in runs.
-function renderRosterColumn(roster: CockpitRosterAgent[], disabled: Set<string>, height: number, active: Set<string> = new Set()): string[] {
-  const lines: string[] = [`${bold('AGENTS')}  ${dim('/enable /disable')}`];
-  for (const agent of roster) {
+function renderRosterColumn(roster: CockpitRosterAgent[], disabled: Set<string>, height: number, active: Set<string> = new Set(), focused = false, cursor = -1): string[] {
+  // When focused, the header is highlighted and a ▸ marks the selected row (Space/Enter toggles it).
+  const header = focused ? `${inverse(' AGENTS ')}  ${dim('↑↓ select · Space toggle')}` : `${bold('AGENTS')}  ${dim('/enable /disable')}`;
+  const lines: string[] = [header];
+  roster.forEach((agent, i) => {
     const off = disabled.has(agent.id);
     const isActive = !off && active.has(agent.id);
+    const selected = focused && i === cursor;
     // While a mission runs, the agent(s) whose role matches the current phase get a ● working badge.
     const box = off ? dim('[ ]') : isActive ? yellow('●') : green('[x]');
     const name = off ? dim(agent.id) : authorStyle(agent.id)(agent.id);
     const badge = isActive ? `  ${yellow('working…')}` : '';
-    lines.push(`${box} ${name}  ${dim(agent.roles.join(', ') || 'agent')}${badge}`);
+    const row = `${box} ${name}  ${dim(agent.roles.join(', ') || 'agent')}${badge}`;
+    lines.push(selected ? `${cyan('▸')} ${row}` : `  ${row}`);
     lines.push('');
-  }
+  });
   while (lines.length < height) lines.push('');
   return lines.slice(0, height);
 }
@@ -1022,7 +1026,7 @@ export function renderMarkdownLines(text: string, width: number): string[] {
   return out;
 }
 
-function renderOutputPanel(entries: ConversationEntry[], width: number, height: number, scroll: number, busyLabel: string): string[] {
+function renderOutputPanel(entries: ConversationEntry[], width: number, height: number, scroll: number, busyLabel: string, focused = false): string[] {
   const contentWidth = width - 4;
   const innerWidth = Math.max(8, contentWidth - 2);
   const bodyH = Math.max(1, height - 2);
@@ -1055,9 +1059,11 @@ function renderOutputPanel(entries: ConversationEntry[], width: number, height: 
   const windowLines = display.slice(start, start + bodyH);
   while (windowLines.length < bodyH) windowLines.push('');
 
-  const title = busyLabel
-    ? ` OUTPUT · ${busyLabel} `
-    : maxScroll > 0 ? ` OUTPUT · ↑↓/PgUp/PgDn (${maxScroll - clamped} above) ` : ' OUTPUT ';
+  const title = focused
+    ? ` ▸ OUTPUT · ↑↓ PgUp/PgDn scroll · Tab/Esc exit${maxScroll > 0 ? ` (${maxScroll - clamped} above)` : ''} `
+    : busyLabel
+      ? ` OUTPUT · ${busyLabel} `
+      : maxScroll > 0 ? ` OUTPUT · ↑↓/PgUp/PgDn (${maxScroll - clamped} above) ` : ' OUTPUT ';
   const fill = Math.max(0, contentWidth - 1 - visibleWidth(title));
   return [
     `┌─${title}${'─'.repeat(fill)}┐`,
@@ -1107,6 +1113,8 @@ class VisualCockpit {
   private scroll = 0;
   private menuIndex = 0; // highlighted row in the slash-command palette
   private missionInFocus = false; // is the dashboard showing a run as the *current* focus (vs. neutral)?
+  private focus: 'prompt' | 'output' | 'agents' = 'prompt'; // Tab-cycled keyboard focus zone
+  private agentCursor = 0; // selected row in the AGENTS panel when it has focus
   private done = false;
   private state: CockpitState;
   private readonly conversation: ConversationEntry[];
@@ -1246,6 +1254,15 @@ class VisualCockpit {
       if (matchesKey(chunk, 'escape')) { this.prompt = ''; this.cursor = 0; this.menuIndex = 0; this.renderToTerminal(); return; }
     }
 
+    // Tab / Shift+Tab cycle keyboard focus: prompt → AGENTS (select/toggle) → OUTPUT (scroll) → …
+    if (chunk === '\t') { this.cycleFocus(1); return; }
+    if (chunk === '\x1b[Z') { this.cycleFocus(-1); return; } // Shift+Tab
+
+    // When focus is on a non-prompt zone, its keys drive that zone. A printable key snaps focus back
+    // to the prompt and is then typed (so you never get stranded away from the input).
+    if (this.focus === 'output' && this.handleOutputKey(chunk)) return;
+    if (this.focus === 'agents' && this.handleAgentsKey(chunk)) return;
+
     // PgUp/PgDn scroll the OUTPUT panel. (Arrow/page escapes contain \x1b so they never match the
     // printable-character test used for prompt typing.)
     if (chunk === '\x1b[5~') { this.scroll += 5; this.renderToTerminal(); return; }
@@ -1267,6 +1284,45 @@ class VisualCockpit {
     if (matchesKey(chunk, 'escape')) { this.prompt = ''; this.cursor = 0; this.promptError = ''; this.renderToTerminal(); return; } // clear the line
 
     await this.handlePromptInput(chunk);
+  }
+
+  // Cycle focus across the interactive zones. AGENTS is only a zone when a roster is configured.
+  private cycleFocus(dir: 1 | -1): void {
+    const zones: Array<'prompt' | 'agents' | 'output'> = ['prompt', ...(this.roster.length ? ['agents' as const] : []), 'output'];
+    const index = zones.indexOf(this.focus);
+    this.focus = zones[(index + dir + zones.length) % zones.length] ?? 'prompt';
+    if (this.focus === 'agents') this.agentCursor = Math.max(0, Math.min(this.agentCursor, this.roster.length - 1));
+    this.renderToTerminal();
+  }
+
+  // OUTPUT focus: arrows/PgUp/PgDn scroll the transcript (higher scroll = older). Esc/Enter return to
+  // the prompt; a printable key returns to the prompt and is typed there. Returns false to fall through.
+  private handleOutputKey(chunk: string): boolean {
+    if (chunk === '\x1b[A' || chunk === '\x1bOA') { this.scroll += 1; this.renderToTerminal(); return true; }
+    if (chunk === '\x1b[B' || chunk === '\x1bOB') { this.scroll = Math.max(0, this.scroll - 1); this.renderToTerminal(); return true; }
+    if (chunk === '\x1b[5~') { this.scroll += 5; this.renderToTerminal(); return true; }
+    if (chunk === '\x1b[6~') { this.scroll = Math.max(0, this.scroll - 5); this.renderToTerminal(); return true; }
+    if (matchesKey(chunk, 'escape') || matchesKey(chunk, 'enter') || chunk === '\r' || chunk === '\n') { this.focus = 'prompt'; this.renderToTerminal(); return true; }
+    if (/^[\x20-\x7E]+$/.test(chunk)) { this.focus = 'prompt'; return false; } // snap to prompt, then type
+    return true; // swallow other control keys
+  }
+
+  // AGENTS focus: arrows move the selection, Space/Enter toggle enable/disable. Esc returns to the
+  // prompt; a printable (non-space) key returns to the prompt and is typed there.
+  private handleAgentsKey(chunk: string): boolean {
+    const count = this.roster.length;
+    if (!count) { this.focus = 'prompt'; return false; }
+    if (chunk === '\x1b[A' || chunk === '\x1bOA') { this.agentCursor = (this.agentCursor - 1 + count) % count; this.renderToTerminal(); return true; }
+    if (chunk === '\x1b[B' || chunk === '\x1bOB') { this.agentCursor = (this.agentCursor + 1) % count; this.renderToTerminal(); return true; }
+    if (chunk === ' ' || matchesKey(chunk, 'enter') || chunk === '\r' || chunk === '\n') {
+      const agent = this.roster[this.agentCursor];
+      if (agent) { if (this.disabledAgents.has(agent.id)) this.disabledAgents.delete(agent.id); else this.disabledAgents.add(agent.id); }
+      this.renderToTerminal();
+      return true;
+    }
+    if (matchesKey(chunk, 'escape')) { this.focus = 'prompt'; this.renderToTerminal(); return true; }
+    if (/^[\x20-\x7E]+$/.test(chunk)) { this.focus = 'prompt'; return false; }
+    return true;
   }
 
   // Up/Down move the cursor between input lines, or scroll the OUTPUT panel once the cursor is at the
@@ -1613,7 +1669,8 @@ class VisualCockpit {
     const rightW = totalWidth - leftW - midW - 4;
 
     const sessionTag = this.sessionId ? dim(` · session ${this.sessionId}`) : '';
-    const title = bold('xdou cockpit') + ' ' + dim('· type to chat · / for commands · Ctrl+C quits') + sessionTag;
+    const focusHint = this.focus === 'prompt' ? dim('· Tab moves focus') : `· ${inverse(` focus: ${this.focus} `)} ${dim('Tab/Esc')}`;
+    const title = bold('xdou cockpit') + ' ' + dim('· type to chat · / for commands ') + focusHint + sessionTag;
     // The mission panels reflect a run only while it's the active focus; otherwise show a neutral
     // state so the dashboard never presents a stale, unrelated run as the current activity.
     const focused = this.missionInFocus && Boolean(this.state.selected);
@@ -1642,7 +1699,7 @@ class VisualCockpit {
     const livePhase = this.liveTimer && this.busy ? this.state.selected?.phase : undefined;
     const activeAgents = livePhase ? activeAgentsForPhase(livePhase, this.roster) : new Set<string>();
     const agentsCol = this.roster.length
-      ? renderRosterColumn(this.roster, this.disabledAgents, colHeight, activeAgents)
+      ? renderRosterColumn(this.roster, this.disabledAgents, colHeight, activeAgents, this.focus === 'agents', this.agentCursor)
       : renderAgentsColumn(agentsFromState(viewState), leftW, colHeight);
     const workspace = renderWorkspaceBar(this.cwd, this.branch, this.contextChars(), this.contextTurns().length);
     return [
@@ -1655,7 +1712,7 @@ class VisualCockpit {
         renderArtifactsColumn(viewState, rightW, colHeight),
         leftW, midW, rightW,
       ),
-      ...renderOutputPanel(this.conversation, totalWidth, outHeight, this.scroll, this.busyLabel()),
+      ...renderOutputPanel(this.conversation, totalWidth, outHeight, this.scroll, this.busyLabel(), this.focus === 'output'),
       ...footer,
       ...composer,
     ];
