@@ -43,11 +43,24 @@ export function buildAssistantPrompt(cwd: string, prompt: string, history: Assis
   const contextBlock = transcript ? `Recent conversation (most recent last):\n${transcript}\n\n` : '';
   return `You are the xdou cockpit assistant. Answer directly and concisely. Do not modify files unless explicitly asked. Current folder: ${cwd}
 
-This is a SINGLE synchronous turn: whatever you produce now is the complete, final reply shown to the user — there is no background processing and no later turn. Therefore:
-- NEVER claim work is "running"/"in progress" or that you will "compile results", "report back", or "follow up" later. You cannot run other agents (codex/claude) or background tasks from here.
-- Do the work now and give the actual answer in this reply. If it genuinely needs the multi-agent pipeline (e.g. "review the whole codebase with codex and claude"), say so plainly and tell the user to run it as a mission: /code <task> or /plan <task>. Do not pretend to orchestrate agents yourself.
+This reply is a SINGLE synchronous turn. You yourself cannot run background tasks — but xdou CAN run the real agent CLIs (codex/claude) for you if you ask it to. So:
+- For questions/explanations: answer directly now. Never claim work is "running" or that you'll "report back later" — you can't.
+- When the user wants actual coding work DONE — make changes, implement, fix, refactor, or "use the CLIs/agents to do the task" — do NOT refuse and do NOT tell them to type a command. Instead, end your reply with exactly ONE directive line that xdou will execute by launching the real agent pipeline:
+    [[XDOU_RUN: <clear, self-contained task to build/fix now>]]
+    [[XDOU_PLAN: <task>]]   (use this form instead if they want a plan/approach before editing)
+  Spell the task out fully in the directive, pulling the concrete details from our conversation — e.g. [[XDOU_RUN: fix bug 1 in orchestrator.ts:106 …, bug 2 in completion-validator.ts:17 …]] — never a vague "[[XDOU_RUN: the task]]". Only emit a directive when the user actually wants action taken; for plain questions, don't.
 
 ${summaryBlock}${contextBlock}Reply to the user's latest message:\n${prompt}`;
+}
+
+// The assistant can hand a concrete mission to the runner by emitting [[XDOU_RUN: …]] / [[XDOU_PLAN: …]].
+// Parse that out of a chat reply: returns the action + mission and the reply with the directive removed.
+export function parseRunDirective(text: string): { action: 'run' | 'plan'; mission: string; cleaned: string } | undefined {
+  const match = /\[\[XDOU_(RUN|PLAN):\s*([\s\S]+?)\]\]/i.exec(text);
+  if (!match) return undefined;
+  const mission = (match[2] ?? '').trim();
+  if (!mission) return undefined;
+  return { action: match[1]?.toUpperCase() === 'PLAN' ? 'plan' : 'run', mission, cleaned: text.replace(match[0], '').trim() };
 }
 
 // Read-only codebase analysis prompt: the agent reads the project and reports concrete findings for

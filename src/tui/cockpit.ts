@@ -5,7 +5,7 @@ import { matchesKey, truncateToWidth, visibleWidth } from '@earendil-works/pi-tu
 import stripAnsi from 'strip-ansi';
 import type { ArtifactStore } from '../core/artifact-store.js';
 import { readCollaborationState, type CollaborationEvent, type CollaborationState } from '../core/live-collaboration.js';
-import { CONTEXT_CHAR_BUDGET, turnChars } from '../core/assistant-prompt.js';
+import { CONTEXT_CHAR_BUDGET, parseRunDirective, turnChars } from '../core/assistant-prompt.js';
 import { killInFlightAgents } from '../agents/base.js';
 import type { RunManifest } from '../types.js';
 
@@ -1129,6 +1129,7 @@ class VisualCockpit {
   private missionInFocus = false; // is the dashboard showing a run as the *current* focus (vs. neutral)?
   private focus: 'prompt' | 'output' | 'agents' | 'artifacts' = 'prompt'; // Tab-cycled keyboard focus zone
   private copyMode = false; // dropped to the normal screen so the terminal can natively select/copy
+  private queuedCommand: CockpitOperatorCommand | undefined; // mission the assistant asked us to run next
   private agentCursor = 0; // selected row in the AGENTS panel when it has focus
   private artifactCursor = 0; // selected artifact in the ARTIFACTS panel when it has focus
   private done = false;
@@ -1750,7 +1751,17 @@ class VisualCockpit {
         // Pass the (post-summary) recent turns + rolling summary so the assistant has bounded memory.
         const result = await this.controller.runInline(command, { history: this.contextTurns(), summary: this.summary });
         this.state = result.state;
-        this.push({ author: result.author, text: result.output.trim() || '(no output)' });
+        let replyText = result.output.trim() || '(no output)';
+        // The assistant can delegate real work to the agent pipeline by emitting [[XDOU_RUN/PLAN: …]].
+        // Honor it: strip the directive from the reply and queue the mission to run after this turn.
+        if (command.action === 'ask') {
+          const directive = parseRunDirective(replyText);
+          if (directive) {
+            this.queuedCommand = directive.action === 'plan' ? { action: 'plan', mission: directive.mission } : { action: 'run', mission: directive.mission };
+            replyText = directive.cleaned || `Handing this to the agents — running a ${directive.action === 'plan' ? 'plan' : 'mission'}…`;
+          }
+        }
+        this.push({ author: result.author, text: replyText });
       }
     } catch (error) {
       failed = true;
@@ -1764,6 +1775,13 @@ class VisualCockpit {
       const took = formatDuration(Date.now() - startedAt);
       this.footerMessage = failed ? `✗ ${busyLabelFor(command)} failed after ${took}` : `✓ done in ${took}`;
       this.renderToTerminal();
+    }
+    // Chain a mission the assistant requested (runs the real CLIs) once the chat turn has closed.
+    if (this.queuedCommand) {
+      const next = this.queuedCommand;
+      this.queuedCommand = undefined;
+      this.push({ author: 'system', text: `▶ Assistant is handing this to the agents — running ${describeCommand(next)}.` });
+      await this.dispatch(next);
     }
   }
 

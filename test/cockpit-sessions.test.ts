@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { ArtifactStore } from '../src/core/artifact-store.js';
 import { isEmptySession, listSessions, newSessionId, pruneEmptySessions, readAllSessions, readSession, writeSession } from '../src/core/cockpit-sessions.js';
 import { filterTeam, teamRoster } from '../src/core/cockpit-team.js';
-import { buildAssistantPrompt, buildSummaryPrompt, buildWebSearchPrompt, capHistory, parseWebProvenance, type AssistantTurn } from '../src/core/assistant-prompt.js';
+import { buildAssistantPrompt, buildSummaryPrompt, buildWebSearchPrompt, capHistory, parseRunDirective, parseWebProvenance, type AssistantTurn } from '../src/core/assistant-prompt.js';
 import type { TeamConfig } from '../src/config/schema.js';
 
 describe('cockpit sessions', () => {
@@ -163,5 +163,18 @@ describe('web research provenance', () => {
     const mid = parseWebProvenance('I will not emit [[WEB_USED:no]] in the middle of my answer.');
     expect(mid.used).toBeUndefined();
     expect(mid.clean).toContain('[[WEB_USED:no]]');
+  });
+});
+
+describe('assistant run directive', () => {
+  it('extracts a mission the assistant hands to the runner and strips the directive', () => {
+    const run = parseRunDirective("Sure, I'll fix those.\n\n[[XDOU_RUN: fix the off-by-one in repo.ts:12 and the null deref in cli.ts:40]]");
+    expect(run).toEqual({ action: 'run', mission: 'fix the off-by-one in repo.ts:12 and the null deref in cli.ts:40', cleaned: "Sure, I'll fix those." });
+  });
+
+  it('supports the PLAN variant and returns undefined when absent or empty', () => {
+    expect(parseRunDirective('[[XDOU_PLAN: design the auth flow]]')?.action).toBe('plan');
+    expect(parseRunDirective('just a normal answer, no directive')).toBeUndefined();
+    expect(parseRunDirective('[[XDOU_RUN: ]]')).toBeUndefined(); // empty mission is ignored
   });
 });
