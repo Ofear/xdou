@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { ArtifactStore } from './core/artifact-store.js';
 import { compileContextPacket } from './core/context-compiler.js';
 import { applyPatch, createProjectSnapshot, createRunWorktree, currentHead, ensureCleanWorkingTree, ensureGitRepo, gitDiff, isGitRepo, removeRunWorktree, repoSummary, reversePatch, withRepoLock } from './core/repo.js';
+import { buildMissionContext } from './core/repo-context.js';
 import { checkMissionCompletion } from './core/mission-check.js';
 import { runGeneratedAcceptanceTests } from './core/acceptance-tests.js';
 import { extractReviewVerdict, reviewVerdictBlocks } from './core/review-verdict.js';
@@ -60,11 +61,21 @@ export class XdouOrchestrator {
     return Object.fromEntries(entries);
   }
 
+  // Context fed to every agent for a mission. Lead with deterministic, mission-targeted exploration
+  // (repo map + matched file:line) so the prompt is small and relevant; follow with a trimmed slice of
+  // generic project metadata (stack/deps). Falls back to plain metadata when there's nothing to target
+  // (no git, or no matches).
+  private async missionProjectContext(mission: string): Promise<string> {
+    const metadata = await repoSummary(this.cwd);
+    const focused = await buildMissionContext(this.cwd, mission).catch(() => '');
+    return focused ? `${focused}\n\n## Project metadata\n${metadata.slice(0, 4000)}` : metadata;
+  }
+
   async brainstorm(mission: string, names = ['claude', 'codex']): Promise<string> {
     await ensureGitRepo(this.cwd);
     const run = await this.store.createRun(mission);
     await this.store.updateManifest(run.id, { status: 'running', phase: 'brainstorm' });
-    const project = await repoSummary(this.cwd);
+    const project = await this.missionProjectContext(mission);
     const snapshotCwd = await createProjectSnapshot(this.cwd, join(this.store.runDir(run.id), 'project-snapshot'));
     await this.store.writeText(run.id, 'project.md', project || 'No common project metadata found.');
     await initializeCollaboration(this.store, run.id, names.map((id) => ({ id, role: 'brainstormer' })));
@@ -105,7 +116,7 @@ export class XdouOrchestrator {
     // A diff is only meaningful with git; in-place/no-git runs apply changes live and report no patch.
     const computeDiff = async (cwd: string): Promise<string> => (isRepo ? gitDiff(cwd) : '');
     await this.store.updateManifest(run.id, { status: 'running', phase: 'council', processPid: process.pid });
-    const project = await repoSummary(this.cwd);
+    const project = await this.missionProjectContext(options.mission);
     // Council/planning agents read a snapshot in isolated git runs; in-place runs just read the cwd.
     const snapshotCwd = inPlace || !isRepo ? this.cwd : await createProjectSnapshot(this.cwd, join(this.store.runDir(run.id), 'project-snapshot'));
     await this.store.writeText(run.id, 'project.md', project || 'No common project metadata found.');
