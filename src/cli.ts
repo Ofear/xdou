@@ -435,7 +435,7 @@ class Xdou extends Command {
     // even if the operator quits before sending a message.
     persist({ entries: history, summary: startSummary, summarizedCount: startSummarizedCount });
     const branch = (await isGitRepo(orchestrator.cwd)) ? await currentBranch(orchestrator.cwd) : undefined;
-    await launchCockpit(state, controller, { sessionId, history, summary: startSummary, summarizedCount: startSummarizedCount, onPersist: persist, roster: teamRoster(team), cwd: orchestrator.cwd, branch });
+    await launchCockpit(state, controller, { sessionId, history, summary: startSummary, summarizedCount: startSummarizedCount, onPersist: persist, roster: teamRoster(team), cwd: orchestrator.cwd, branch, focusRun: Boolean(selectedRunId) });
     await persistChain;
     // A session that never got a real message (quit before chatting) is noise — drop it and say
     // nothing about resuming. Only advertise the resume id when there's an actual conversation to resume.

@@ -528,14 +528,21 @@ function renderWorkspaceBar(cwd: string, branch: string | undefined, contextChar
   return `  ${place}  ${ref}   ${dim('·')}   ${ctx}`;
 }
 
-function renderEmptyMissionHeader(width: number): string[] {
+function renderEmptyMissionHeader(width: number, lastRun?: RunManifest): string[] {
   const contentWidth = width - 4;
-  return [
+  const lines = [
     `┌${'─'.repeat(contentWidth)}┐`,
-    pad(`  ${bold('No active mission')} ${dim('· chatting — start one with /code <idea> or /plan <idea>')}`, contentWidth),
-    `└${'─'.repeat(contentWidth)}┘`,
-    '',
+    pad(`  ${bold('No active mission')} ${dim('· chatting/reviewing — start one with /code <idea> or /plan <idea>')}`, contentWidth),
   ];
+  // Point at the most recent run (clearly labeled as past) so it's discoverable without masquerading
+  // as the current activity in the panels above.
+  if (lastRun) {
+    const endMs = Date.parse(lastRun.updatedAt);
+    const age = Number.isFinite(endMs) ? ` · ${formatDuration(Date.now() - endMs)} ago` : '';
+    lines.push(pad(`  ${dim(`Last run: ${lastRun.id} · ${lastRun.status}${age} · /status or /diff to inspect`)}`, contentWidth));
+  }
+  lines.push(`└${'─'.repeat(contentWidth)}┘`, '');
+  return lines;
 }
 
 function renderAgentsColumn(agents: AgentCard[], width: number, height: number): string[] {
@@ -857,6 +864,7 @@ export interface CockpitLaunchOptions {
   roster?: CockpitRosterAgent[];                          // agents that can be toggled on/off
   cwd?: string;                                           // working directory shown in the header
   branch?: string | undefined;                            // current git branch, or undefined if no repo
+  focusRun?: boolean;                                     // launched pointed at a specific run → show it as active
 }
 
 // Distinct, stable color per author so it's obvious at a glance who wrote what in the OUTPUT panel.
@@ -876,6 +884,12 @@ function authorStyle(author: string): (s: string) => string {
 function isMissionCommand(command: CockpitOperatorCommand): boolean {
   return command.action === 'plan' || command.action === 'run' || command.action === 'fix' || command.action === 'parallel';
 }
+
+// Actions that make a run the dashboard's active focus — running it, or inspecting/acting on it.
+// Everything else (ask/web/find/analyze) is chat/review work that shifts focus away from any run.
+const MISSION_FOCUS_ACTIONS = new Set([
+  'run', 'plan', 'parallel', 'fix', 'diff', 'review', 'status', 'apply', 'test', 'discard', 'undo', 'continue',
+]);
 
 // True when the operator explicitly asked for a mission (typed /plan, /run, /code, …). Plain prose
 // that merely *looks* like a mission is not explicit, so we confirm before launching agents.
@@ -1092,6 +1106,7 @@ class VisualCockpit {
   private liveTimer: ReturnType<typeof setInterval> | undefined; // polls run state while a mission runs
   private scroll = 0;
   private menuIndex = 0; // highlighted row in the slash-command palette
+  private missionInFocus = false; // is the dashboard showing a run as the *current* focus (vs. neutral)?
   private done = false;
   private state: CockpitState;
   private readonly conversation: ConversationEntry[];
@@ -1121,6 +1136,9 @@ class VisualCockpit {
     this.sessionId = options.sessionId;
     this.cwd = options.cwd ?? process.cwd();
     this.branch = options.branch;
+    // Only treat a run as the active focus on launch if the operator explicitly opened one, or it's
+    // still running. Otherwise the dashboard starts neutral ("no active mission") with a last-run pointer.
+    this.missionInFocus = Boolean(options.focusRun) || initialState.selected?.status === 'running';
     this.onPersist = options.onPersist;
   }
 
@@ -1539,6 +1557,9 @@ class VisualCockpit {
   private async dispatch(command: CockpitOperatorCommand): Promise<void> {
     this.footerMessage = '';
     this.scroll = 0;
+    // The dashboard focuses a run only while you're running/inspecting a mission. A chat/web/find/
+    // analyze turn shifts focus away, so the panels go neutral instead of showing a stale old run.
+    this.missionInFocus = MISSION_FOCUS_ACTIONS.has(command.action);
     this.startSpinner(busyLabelFor(command));
     // Missions write live timeline/artifact events; poll them so the dashboard shows progress.
     if (isMissionCommand(command)) this.startLivePoll();
@@ -1593,12 +1614,18 @@ class VisualCockpit {
 
     const sessionTag = this.sessionId ? dim(` · session ${this.sessionId}`) : '';
     const title = bold('xdou cockpit') + ' ' + dim('· type to chat · / for commands · Ctrl+C quits') + sessionTag;
-    const header = this.state.selected ? renderMissionHeader(this.state, totalWidth) : renderEmptyMissionHeader(totalWidth);
+    // The mission panels reflect a run only while it's the active focus; otherwise show a neutral
+    // state so the dashboard never presents a stale, unrelated run as the current activity.
+    const focused = this.missionInFocus && Boolean(this.state.selected);
+    const viewState: CockpitState = focused
+      ? this.state
+      : { runs: this.state.runs, selected: undefined, timeline: [], verdicts: [], artifacts: { plan: [], diff: [], review: [], summary: [] } };
+    const header = focused ? renderMissionHeader(viewState, totalWidth) : renderEmptyMissionHeader(totalWidth, this.state.selected);
     // While the slash palette is open it replaces the action hints below the OUTPUT panel.
     const menu = this.menuItems();
     const footer = menu.length
       ? renderSlashMenu(menu, Math.max(0, Math.min(this.menuIndex, menu.length - 1)), totalWidth)
-      : renderActionsFooter(this.state);
+      : renderActionsFooter(viewState);
     const composer = renderPromptComposer(totalWidth, this.prompt, this.promptError, this.footerMessage, this.cursor);
 
     // Divide the remaining vertical space between the dashboard columns and the OUTPUT panel so the
@@ -1616,7 +1643,7 @@ class VisualCockpit {
     const activeAgents = livePhase ? activeAgentsForPhase(livePhase, this.roster) : new Set<string>();
     const agentsCol = this.roster.length
       ? renderRosterColumn(this.roster, this.disabledAgents, colHeight, activeAgents)
-      : renderAgentsColumn(agentsFromState(this.state), leftW, colHeight);
+      : renderAgentsColumn(agentsFromState(viewState), leftW, colHeight);
     const workspace = renderWorkspaceBar(this.cwd, this.branch, this.contextChars(), this.contextTurns().length);
     return [
       title,
@@ -1624,8 +1651,8 @@ class VisualCockpit {
       ...header,
       ...threeColumn(
         agentsCol,
-        renderTimelineColumn(this.state, midW, colHeight),
-        renderArtifactsColumn(this.state, rightW, colHeight),
+        renderTimelineColumn(viewState, midW, colHeight),
+        renderArtifactsColumn(viewState, rightW, colHeight),
         leftW, midW, rightW,
       ),
       ...renderOutputPanel(this.conversation, totalWidth, outHeight, this.scroll, this.busyLabel()),
