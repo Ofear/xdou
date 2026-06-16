@@ -736,10 +736,11 @@ function editableRows(label: string, prompt: string, width: number, cursor: numb
   });
 }
 
-function renderPromptComposer(width: number, activePrompt: string, promptError?: string, footerMessage?: string, cursor?: number): string[] {
+function renderPromptComposer(width: number, activePrompt: string, promptError?: string, footerMessage?: string, cursor?: number, focused = false): string[] {
   const contentWidth = width - 4;
   const innerWidth = Math.max(8, contentWidth - 2); // leading "  " indent
-  const lines: string[] = [`┌${'─'.repeat(contentWidth)}┐`];
+  const edge = (line: string): string => (focused ? cyan(line) : line); // colored border shows focus
+  const lines: string[] = [edge(`┌${'─'.repeat(contentWidth)}┐`)];
   if (activePrompt) {
     const cur = cursor === undefined ? activePrompt.length : Math.max(0, Math.min(cursor, activePrompt.length));
     // Leave one cell for a trailing cursor block so it never overflows the box.
@@ -747,7 +748,7 @@ function renderPromptComposer(width: number, activePrompt: string, promptError?:
   } else {
     lines.push(pad(`  ${dim('Type to chat · / for commands · \\ then Enter = newline')}`, contentWidth));
   }
-  lines.push(`└${'─'.repeat(contentWidth)}┘`);
+  lines.push(edge(`└${'─'.repeat(contentWidth)}┘`));
   if (promptError) lines.push(red(`  ${promptError}`));
   if (footerMessage) lines.push(dim(`  ${footerMessage}`));
   return lines;
@@ -1072,15 +1073,16 @@ function renderOutputPanel(entries: ConversationEntry[], width: number, height: 
   while (windowLines.length < bodyH) windowLines.push('');
 
   const title = focused
-    ? ` ▸ OUTPUT · ↑↓ PgUp/PgDn scroll · Tab/Esc exit${maxScroll > 0 ? ` (${maxScroll - clamped} above)` : ''} `
+    ? ` ▸ OUTPUT · ↑↓ scroll · c copy · Tab/Esc exit${maxScroll > 0 ? ` (${maxScroll - clamped} above)` : ''} `
     : busyLabel
       ? ` OUTPUT · ${busyLabel} `
       : maxScroll > 0 ? ` OUTPUT · ↑↓/PgUp/PgDn (${maxScroll - clamped} above) ` : ' OUTPUT ';
   const fill = Math.max(0, contentWidth - 1 - visibleWidth(title));
+  const edge = (line: string): string => (focused ? cyan(line) : line); // colored border shows focus
   return [
-    `┌─${title}${'─'.repeat(fill)}┐`,
+    edge(`┌─${title}${'─'.repeat(fill)}┐`),
     ...windowLines.map((l) => pad(l, contentWidth)),
-    `└${'─'.repeat(contentWidth)}┘`,
+    edge(`└${'─'.repeat(contentWidth)}┘`),
   ];
 }
 
@@ -1126,6 +1128,7 @@ class VisualCockpit {
   private menuIndex = 0; // highlighted row in the slash-command palette
   private missionInFocus = false; // is the dashboard showing a run as the *current* focus (vs. neutral)?
   private focus: 'prompt' | 'output' | 'agents' | 'artifacts' = 'prompt'; // Tab-cycled keyboard focus zone
+  private copyMode = false; // dropped to the normal screen so the terminal can natively select/copy
   private agentCursor = 0; // selected row in the AGENTS panel when it has focus
   private artifactCursor = 0; // selected artifact in the ARTIFACTS panel when it has focus
   private done = false;
@@ -1253,6 +1256,7 @@ class VisualCockpit {
 
   private async handleKey(chunk: string): Promise<void> {
     if (matchesKey(chunk, 'ctrl+c')) { this.shutdown(); return; }
+    if (this.copyMode) { this.exitCopyView(); return; } // any key returns from the native-copy view
     if (this.busy) return; // ignore keystrokes while a command is running
 
     // Slash-command palette: while it's open, ↑/↓ move the selection, Tab completes, Enter runs the
@@ -1324,9 +1328,31 @@ class VisualCockpit {
     if (chunk === '\x1b[B' || chunk === '\x1bOB') { this.scroll = Math.max(0, this.scroll - 1); this.renderToTerminal(); return true; }
     if (chunk === '\x1b[5~') { this.scroll += 5; this.renderToTerminal(); return true; }
     if (chunk === '\x1b[6~') { this.scroll = Math.max(0, this.scroll - 5); this.renderToTerminal(); return true; }
+    if (chunk === 'c' || chunk === 'C') { this.enterCopyView(); return true; } // native select/copy
     if (matchesKey(chunk, 'escape') || matchesKey(chunk, 'enter') || chunk === '\r' || chunk === '\n') { this.focus = 'prompt'; this.renderToTerminal(); return true; }
     if (/^[\x20-\x7E]+$/.test(chunk)) { this.focus = 'prompt'; return false; } // snap to prompt, then type
     return true; // swallow other control keys
+  }
+
+  // Drop the alternate screen and print the whole transcript to the normal buffer, where the terminal's
+  // own scrollback + mouse drag / shift-click selection + copy all work normally. Any key returns.
+  private enterCopyView(): void {
+    this.copyMode = true;
+    this.stopSpinner();
+    this.stdout.write('\x1b[?1049l\x1b[?25h'); // leave alt screen, show cursor
+    const out: string[] = ['', '──── transcript — select & copy with your mouse/terminal; press any key to return ────', ''];
+    for (const entry of this.conversation) {
+      out.push(`### ${entry.mine ? 'you' : entry.author}`);
+      out.push(entry.text, '');
+    }
+    out.push('──── end of transcript — press any key to return to the cockpit ────');
+    this.stdout.write(`${out.join('\r\n')}\r\n`); // plain text (no ANSI) so copied text is clean
+  }
+
+  private exitCopyView(): void {
+    this.copyMode = false;
+    this.stdout.write('\x1b[?1049h\x1b[?25l'); // re-enter alt screen, hide cursor
+    this.renderToTerminal();
   }
 
   // AGENTS focus: arrows move the selection, Space/Enter toggle enable/disable. Esc returns to the
@@ -1736,7 +1762,7 @@ class VisualCockpit {
     const footer = menu.length
       ? renderSlashMenu(menu, Math.max(0, Math.min(this.menuIndex, menu.length - 1)), totalWidth)
       : renderActionsFooter(viewState);
-    const composer = renderPromptComposer(totalWidth, this.prompt, this.promptError, this.footerMessage, this.cursor);
+    const composer = renderPromptComposer(totalWidth, this.prompt, this.promptError, this.footerMessage, this.cursor, this.focus === 'prompt');
 
     // Divide the remaining vertical space between the dashboard columns and the OUTPUT panel so the
     // whole frame fits one screenful (no wrap/scroll) regardless of terminal height.
