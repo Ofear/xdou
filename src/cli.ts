@@ -23,6 +23,7 @@ import { runLoopsCommand } from './commands/loops.js';
 import { runPluginsCommand, type PluginCommandContext } from './commands/plugins.js';
 import { installCrashHandlers } from './core/crash-log.js';
 import type { DaemonInvocation } from './core/loop-engine.js';
+import type { AgentHealth } from './types.js';
 
 interface ProjectResolutionOptions { project?: string | undefined; yes?: boolean; noInit?: boolean; dryRun?: boolean }
 
@@ -411,6 +412,22 @@ class Xdou extends Command {
         const header = `Read-only review by ${agents.map((agent) => agent.id).join(' + ')} — no files were changed.`;
         return { output: [header, ...sections].join('\n\n'), author: 'xdou', state: await refresh() };
       },
+      // Agent health for the AGENTS panel: detect() gives installed/version; for claude-code agents we
+      // also probe `<cmd> auth status` so the panel can show 'not logged in' instead of a silent
+      // one-agent mission later.
+      detectAgents: async () => {
+        const detected = await orchestrator.detectAgents();
+        const out: Record<string, AgentHealth> = {};
+        await Promise.all(Object.entries(detected).map(async ([id, det]) => {
+          const adapter = orchestrator.agents[id];
+          let loggedIn: boolean | undefined;
+          if (det.available && adapter?.type === 'claude-code') {
+            loggedIn = await this.probeClaudeLogin(adapter.command);
+          }
+          out[id] = { available: det.available, ...(det.version ? { version: det.version } : {}), ...(det.error ? { error: det.error } : {}), ...(loggedIn !== undefined ? { loggedIn } : {}) };
+        }));
+        return out;
+      },
       // Missions (plan/run/parallel/fix) drive the agent pipeline. Agents run with piped stdio, so we
       // capture their log output and hand it back for the OUTPUT panel — the cockpit stays on screen
       // with a live spinner rather than dropping to a blank terminal while the mission runs.
@@ -484,6 +501,18 @@ class Xdou extends Command {
       }
     }));
     return [`Forked ${forkAgents.length} run(s) — compare with /diff <run-id>:`, ...results.map((line) => `  ${line}`)].join('\n');
+  }
+
+  // Best-effort claude login check: `claude auth status` prints {"loggedIn": true|false} and exits 0.
+  // Returns undefined if the probe can't be run/parsed (so we never assert a login state we don't know).
+  private async probeClaudeLogin(command: string): Promise<boolean | undefined> {
+    try {
+      const result = await execa(command, ['auth', 'status'], { reject: false, timeout: 5_000 });
+      const parsed = JSON.parse(result.stdout.trim()) as { loggedIn?: unknown };
+      return typeof parsed.loggedIn === 'boolean' ? parsed.loggedIn : undefined;
+    } catch {
+      return undefined;
+    }
   }
 
   private async sessions(orchestrator: XdouOrchestrator, args: string[], json: boolean): Promise<void> {

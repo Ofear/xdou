@@ -7,7 +7,7 @@ import type { ArtifactStore } from '../core/artifact-store.js';
 import { readCollaborationState, type CollaborationEvent, type CollaborationState } from '../core/live-collaboration.js';
 import { CONTEXT_CHAR_BUDGET, parseRunDirective, turnChars } from '../core/assistant-prompt.js';
 import { killInFlightAgents } from '../agents/base.js';
-import type { RunManifest } from '../types.js';
+import type { AgentHealth, RunManifest } from '../types.js';
 
 // Verbatim conversation past this many characters triggers an automatic summary fold-in before the
 // next chat call. Kept below CONTEXT_CHAR_BUDGET so older turns get summarized (not silently dropped
@@ -569,7 +569,16 @@ function renderAgentsColumn(agents: AgentCard[], width: number, height: number):
 }
 
 // The toggleable roster: each agent shows a checkbox reflecting whether it participates in runs.
-function renderRosterColumn(roster: CockpitRosterAgent[], disabled: Set<string>, height: number, active: Set<string> = new Set(), focused = false, cursor = -1): string[] {
+// One-line CLI health badge for an agent: not-installed / not-logged-in / ready(version) / unknown.
+function agentHealthBadge(health: AgentHealth | undefined): string {
+  if (!health) return dim('· checking…');
+  if (!health.available) return red('✗ not found');
+  if (health.loggedIn === false) return red('⚠ not logged in');
+  const version = health.version ? health.version.split(/\s+/)[0] : 'ready';
+  return dim(`✓ ${version}${health.loggedIn === true ? ' · logged in' : ''}`);
+}
+
+function renderRosterColumn(roster: CockpitRosterAgent[], disabled: Set<string>, height: number, active: Set<string> = new Set(), focused = false, cursor = -1, health: Record<string, AgentHealth> = {}): string[] {
   // When focused, the header is highlighted and a ▸ marks the selected row (Space/Enter toggles it).
   const header = focused ? `${inverse(' AGENTS ')}  ${dim('↑↓ select · Space toggle')}` : `${bold('AGENTS')}  ${dim('/enable /disable')}`;
   const lines: string[] = [header];
@@ -583,7 +592,8 @@ function renderRosterColumn(roster: CockpitRosterAgent[], disabled: Set<string>,
     const badge = isActive ? `  ${yellow('working…')}` : '';
     const row = `${box} ${name}  ${dim(agent.roles.join(', ') || 'agent')}${badge}`;
     lines.push(selected ? `${cyan('▸')} ${row}` : `  ${row}`);
-    lines.push('');
+    // CLI install/login status under each agent so a one-agent mission is never a surprise.
+    lines.push(`     ${agentHealthBadge(health[agent.id])}`);
   });
   while (lines.length < height) lines.push('');
   return lines.slice(0, height);
@@ -861,6 +871,8 @@ export interface CockpitController {
   // Read-only multi-agent analysis: run each enabled agent over the codebase for `request` (no edits)
   // and return their combined findings for the OUTPUT panel.
   runReview(request: string, opts: { disabledAgents: string[] }): Promise<CockpitCommandResult>;
+  // Per-agent health for the AGENTS panel: is the CLI installed (+version) and, where checkable, logged in.
+  detectAgents(): Promise<Record<string, AgentHealth>>;
 }
 
 export interface CockpitSessionSummary { id: string; updatedAt: string; messages: number; last: string }
@@ -1130,6 +1142,7 @@ class VisualCockpit {
   private focus: 'prompt' | 'output' | 'agents' | 'artifacts' = 'prompt'; // Tab-cycled keyboard focus zone
   private copyMode = false; // dropped to the normal screen so the terminal can natively select/copy
   private queuedCommand: CockpitOperatorCommand | undefined; // mission the assistant asked us to run next
+  private agentHealth: Record<string, AgentHealth> = {}; // CLI installed/version/login per agent (for AGENTS panel)
   private agentCursor = 0; // selected row in the AGENTS panel when it has focus
   private artifactCursor = 0; // selected artifact in the ARTIFACTS panel when it has focus
   private done = false;
@@ -1245,6 +1258,13 @@ class VisualCockpit {
     // Enter alternate screen buffer + hide cursor
     this.stdout.write('\x1b[?1049h\x1b[?25l');
     this.renderToTerminal();
+    // Detect agent CLI availability/login in the background and refresh the AGENTS panel when known.
+    void this.refreshAgentHealth();
+  }
+
+  private async refreshAgentHealth(): Promise<void> {
+    if (!this.roster.length) return;
+    try { this.agentHealth = await this.controller.detectAgents(); if (!this.done) this.renderToTerminal(); } catch { /* leave as unknown */ }
   }
 
   private async handleInput(data: string): Promise<void> {
@@ -1822,7 +1842,7 @@ class VisualCockpit {
     const livePhase = this.liveTimer && this.busy ? this.state.selected?.phase : undefined;
     const activeAgents = livePhase ? activeAgentsForPhase(livePhase, this.roster) : new Set<string>();
     const agentsCol = this.roster.length
-      ? renderRosterColumn(this.roster, this.disabledAgents, colHeight, activeAgents, this.focus === 'agents', this.agentCursor)
+      ? renderRosterColumn(this.roster, this.disabledAgents, colHeight, activeAgents, this.focus === 'agents', this.agentCursor, this.agentHealth)
       : renderAgentsColumn(agentsFromState(viewState), leftW, colHeight);
     const workspace = renderWorkspaceBar(this.cwd, this.branch, this.contextChars(), this.contextTurns().length);
     return [

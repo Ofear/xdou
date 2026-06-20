@@ -5,6 +5,7 @@ import type { AgentAdapter, AgentInput, AgentInvocation, AgentRole, AgentRunResu
 export class OpenRouterAdapter implements AgentAdapter {
   readonly id: string;
   readonly type = 'openrouter' as const;
+  readonly command = 'openrouter-api'; // HTTP API, not a CLI binary
   readonly roles: AgentRole[];
   private readonly model: string;
   private readonly apiKeyEnv: string;
