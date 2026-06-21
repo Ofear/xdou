@@ -1143,6 +1143,7 @@ class VisualCockpit {
   private copyMode = false; // dropped to the normal screen so the terminal can natively select/copy
   private queuedCommand: CockpitOperatorCommand | undefined; // mission the assistant asked us to run next
   private agentHealth: Record<string, AgentHealth> = {}; // CLI installed/version/login per agent (for AGENTS panel)
+  private lastHealthAt = 0; // throttle re-detection so focusing AGENTS repeatedly doesn't spam subprocesses
   private agentCursor = 0; // selected row in the AGENTS panel when it has focus
   private artifactCursor = 0; // selected artifact in the ARTIFACTS panel when it has focus
   private done = false;
@@ -1262,8 +1263,13 @@ class VisualCockpit {
     void this.refreshAgentHealth();
   }
 
-  private async refreshAgentHealth(): Promise<void> {
+  // Re-detect agent CLI health. Throttled so repeatedly focusing the AGENTS panel doesn't spawn a
+  // burst of `which`/`auth status` subprocesses; `force` (launch, /agents) bypasses the throttle.
+  private async refreshAgentHealth(force = false): Promise<void> {
     if (!this.roster.length) return;
+    const now = Date.now();
+    if (!force && now - this.lastHealthAt < 2000) return;
+    this.lastHealthAt = now;
     try { this.agentHealth = await this.controller.detectAgents(); if (!this.done) this.renderToTerminal(); } catch { /* leave as unknown */ }
   }
 
@@ -1337,7 +1343,7 @@ class VisualCockpit {
     ];
     const index = zones.indexOf(this.focus);
     this.focus = zones[(index + dir + zones.length) % zones.length] ?? 'prompt';
-    if (this.focus === 'agents') this.agentCursor = Math.max(0, Math.min(this.agentCursor, this.roster.length - 1));
+    if (this.focus === 'agents') { this.agentCursor = Math.max(0, Math.min(this.agentCursor, this.roster.length - 1)); void this.refreshAgentHealth(); }
     if (this.focus === 'artifacts') this.artifactCursor = Math.max(0, Math.min(this.artifactCursor, focusableArtifacts(this.state).length - 1));
     this.renderToTerminal();
   }
@@ -1679,7 +1685,8 @@ class VisualCockpit {
       const lines = this.roster.length
         ? this.roster.map((a) => `${this.disabledAgents.has(a.id) ? '[ ]' : '[x]'} ${a.id}  (${a.roles.join(', ') || 'agent'})`)
         : ['(no roster configured)'];
-      this.push({ author: 'system', text: ['Agents (/enable <id>, /disable <id> to toggle):', ...lines].join('\n') });
+      this.push({ author: 'system', text: ['Agents (/enable <id>, /disable <id> to toggle):', ...lines, 're-checking CLI availability/login…'].join('\n') });
+      void this.refreshAgentHealth(true); // force a fresh detect (e.g. after logging in to a CLI)
       return true;
     }
     if (lower === 'enable' || lower === 'disable') {
