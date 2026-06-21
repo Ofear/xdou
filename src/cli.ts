@@ -421,9 +421,8 @@ class Xdou extends Command {
         await Promise.all(Object.entries(detected).map(async ([id, det]) => {
           const adapter = orchestrator.agents[id];
           let loggedIn: boolean | undefined;
-          if (det.available && adapter?.type === 'claude-code') {
-            loggedIn = await this.probeClaudeLogin(adapter.command);
-          }
+          if (det.available && adapter?.type === 'claude-code') loggedIn = await this.probeClaudeLogin(adapter.command);
+          else if (det.available && adapter?.type === 'codex') loggedIn = await this.probeCodexLogin(adapter.command);
           out[id] = { available: det.available, ...(det.version ? { version: det.version } : {}), ...(det.error ? { error: det.error } : {}), ...(loggedIn !== undefined ? { loggedIn } : {}) };
         }));
         return out;
@@ -510,6 +509,21 @@ class Xdou extends Command {
       const result = await execa(command, ['auth', 'status'], { reject: false, timeout: 5_000 });
       const parsed = JSON.parse(result.stdout.trim()) as { loggedIn?: unknown };
       return typeof parsed.loggedIn === 'boolean' ? parsed.loggedIn : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  // codex login status prints "Logged in using ChatGPT" (exit 0) when authed, and a not-logged-in
+  // message / non-zero exit otherwise. Plain text, not JSON — match conservatively.
+  private async probeCodexLogin(command: string): Promise<boolean | undefined> {
+    try {
+      const result = await execa(command, ['login', 'status'], { reject: false, timeout: 5_000 });
+      const text = `${result.stdout}\n${result.stderr}`.toLowerCase();
+      if (/not logged in|no .*credential|please .*log ?in|run .*login/.test(text)) return false;
+      if (result.exitCode === 0 && /logged in/.test(text)) return true;
+      if (result.exitCode !== 0) return false;
+      return undefined;
     } catch {
       return undefined;
     }

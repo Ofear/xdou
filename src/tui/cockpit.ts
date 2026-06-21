@@ -574,7 +574,8 @@ function agentHealthBadge(health: AgentHealth | undefined): string {
   if (!health) return dim('· checking…');
   if (!health.available) return red('✗ not found');
   if (health.loggedIn === false) return red('⚠ not logged in');
-  const version = health.version ? health.version.split(/\s+/)[0] : 'ready';
+  // Prefer a version number (e.g. "0.139.0" out of "codex-cli 0.139.0") over the leading word.
+  const version = health.version ? (/\d+\.\d+[\w.]*/.exec(health.version)?.[0] ?? health.version.split(/\s+/)[0]) : 'ready';
   return dim(`✓ ${version}${health.loggedIn === true ? ' · logged in' : ''}`);
 }
 
